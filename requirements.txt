@@ -1,0 +1,7 @@
+google-genai==2.29.0
+pyTelegramBotAPI==4.37.0
+PyMuPDF==1.28.2
+Pillow==12.3.0
+python-dotenv==1.2.4
+rarfile==4.5
+zxing-cpp==3.1.1
