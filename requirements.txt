@@ -5,3 +5,4 @@ Pillow==12.3.0
 python-dotenv==1.2.4
 rarfile==4.5
 zxing-cpp==3.1.1
+# System package required for article OCR: tesseract-ocr >= 5

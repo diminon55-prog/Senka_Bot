@@ -109,7 +109,8 @@ class Retry503Tests(unittest.TestCase):
 
         self.assertEqual(direct_requests, [])
         self.assertEqual(wrapped_operations.count("generate_images"), 1)
-        self.assertEqual(wrapped_operations.count("send_message"), 4)
+        self.assertEqual(wrapped_operations.count("generate_content"), 1)
+        self.assertEqual(wrapped_operations.count("send_message"), 5)
 
 
 if __name__ == "__main__":

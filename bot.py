@@ -4,7 +4,7 @@ from contextvars import ContextVar
 from google import genai
 from google.genai import types
 import cz_processor
-from marks_inventory import MarksInventory
+from marks_inventory import ArticleOcrError, MarksInventory
 from settings import (
     GEMINI_CHAT_MODEL,
     GEMINI_IMAGE_MODEL,
@@ -15,8 +15,13 @@ from settings import (
     MARKS_GRID_ROWS,
     MARKS_HIGHLIGHT_OPACITY,
     MARKS_MAX_QUANTITY,
+    MARKS_OCR_DPI,
+    MARKS_OCR_MAX_PAGES,
+    MARKS_OCR_TIMEOUT_SECONDS,
+    MARKS_OCR_TOTAL_TIMEOUT_SECONDS,
     MARKS_SCAN_DPI,
     MARKS_STORAGE_DIR,
+    MARKS_TESSERACT_COMMAND,
     MAX_503_RETRIES,
     MAX_FILE_SIZE,
     RETRY_DELAY_SECONDS,
@@ -45,6 +50,74 @@ def get_active_chat_id():
 
 bot_stats = {"requests": 0, "tokens": 0}
 
+HELP_BUTTON_TEXT = "ℹ️ Что умеет Сеня?"
+PLAIN_ARTICLE_PATTERN = re.compile(
+    r"(?:COVANI\s+)?(?=[A-Z0-9$-]*[A-Z])(?=[A-Z0-9$-]*\d)"
+    r"[A-Z0-9$]{2,}(?:-[A-Z0-9$]{2,})+",
+    re.IGNORECASE,
+)
+HELP_TEXT = (
+    "Что умеет Сеня:\n\n"
+    "🧠 Общаться и анализировать текст, фото, видео и PDF через Gemini.\n"
+    "🎨 /draw <описание> — нарисовать изображение.\n"
+    "📐 /spusk — сделать A3-раскладку последнего PDF.\n"
+    "📦 ZIP/RAR с PDF — собрать печать и резку Честного Знака.\n\n"
+    "Учёт марок:\n"
+    "1. Отправь PDF с марками один раз. Для удобного поиска добавь подпись "
+    "«Название: Зелёные футболки».\n"
+    "2. Если есть CSV-индекс с колонками Лист/Ряд/Колонка/Название/Код, отправь его "
+    "после PDF — поиск будет мгновенным и без OCR.\n"
+    "3. Отправь крупное фото одного квадрата Data Matrix — Сеня распознает код, "
+    "найдёт марку в базе, отметит её зелёным и пришлёт PDF. "
+    "Голосовое с названием или артикулом тоже сработает: Сеня переведёт речь в текст "
+    "и найдёт марку.\n"
+    "4. /findmark <код или название> — найти одну марку.\n"
+    "5. /findmark 2 <название> — найти несколько марок.\n"
+    "6. /findarticle <артикул> — найти марку по артикулу, отметить её зелёным и "
+    "сообщить лист и порядковый номер на листе.\n"
+    "7. /markstats — показать общий остаток.\n"
+    "8. /unmark [N] <код, название или артикул> — вернуть ошибочно выбранные марки "
+    "в базу.\n"
+    "9. /export — выгрузить все выбранные марки в CSV для ревизии.\n\n"
+    "Другие команды:\n"
+    "/stats — статистика запросов Gemini.\n"
+    "/reset — сбросить только диалоговый контекст; база марок сохранится.\n"
+    "/help — снова показать эту справку."
+)
+
+
+def build_main_keyboard():
+    keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, is_persistent=True)
+    keyboard.add(telebot.types.KeyboardButton(HELP_BUTTON_TEXT))
+    return keyboard
+
+
+def extract_plain_article(text):
+    candidate = re.sub(r"\s+", " ", (text or "").strip())
+    return candidate if PLAIN_ARTICLE_PATTERN.fullmatch(candidate) else ""
+
+
+def send_claimed_document(chat_id, result, caption):
+    marked_pdf = io.BytesIO(result.pdf_bytes)
+    marked_pdf.name = result.output_name
+    claim_token = getattr(result, "claim_token", "")
+    try:
+        bot.send_document(chat_id, marked_pdf, caption=caption)
+    except Exception as send_error:
+        if claim_token:
+            try:
+                marks_store.release_claim(chat_id, claim_token)
+            except Exception as release_error:
+                raise send_error from release_error
+        raise
+    if claim_token:
+        marks_store.finalize_claim(chat_id, claim_token)
+    pending_suggestions.pop(chat_id, None)
+
+
+CANCEL_WORDS = frozenset({"отмена", "отменить", "отбой", "стоп", "хватит"})
+pending_suggestions: dict[int, list[str]] = {}
+
 marks_store = MarksInventory(
     db_path=MARKS_DB_PATH,
     storage_dir=MARKS_STORAGE_DIR,
@@ -55,6 +128,11 @@ marks_store = MarksInventory(
     cell_height_pt=MARKS_CELL_HEIGHT_PT,
     highlight_opacity=MARKS_HIGHLIGHT_OPACITY,
     max_quantity=MARKS_MAX_QUANTITY,
+    ocr_dpi=MARKS_OCR_DPI,
+    tesseract_command=MARKS_TESSERACT_COMMAND,
+    ocr_timeout_seconds=MARKS_OCR_TIMEOUT_SECONDS,
+    ocr_max_pages=MARKS_OCR_MAX_PAGES,
+    ocr_total_timeout_seconds=MARKS_OCR_TOTAL_TIMEOUT_SECONDS,
 )
 
 def is_service_unavailable(error):
@@ -245,14 +323,52 @@ def tool_find_marks(query: str, quantity: int = 1) -> str:
     if not chat_id:
         return "ОШИБКА: Не удалось определить чат."
 
+    article = extract_plain_article(query)
+    if article and re.match(r"^COVANI\s+", article, re.IGNORECASE):
+        return tool_find_article(article, quantity)
+
     result = marks_store.claim(chat_id, query, quantity)
     if result.matched == 0:
         return f"Марки по запросу '{query}' не найдены. Свободно: {result.available}."
 
-    marked_pdf = io.BytesIO(result.pdf_bytes)
-    marked_pdf.name = result.output_name
     caption = f"✅ Найдено и отмечено: {result.matched}. Свободно: {result.available}."
-    bot.send_document(chat_id, marked_pdf, caption=caption)
+    send_claimed_document(chat_id, result, caption)
+    return caption
+
+
+def tool_find_article(article: str, quantity: int = 1) -> str:
+    """Находит свободную марку по артикулу и сообщает её позицию на листе."""
+    chat_id = get_active_chat_id()
+    if not chat_id:
+        return "ОШИБКА: Не удалось определить чат."
+
+    try:
+        result = marks_store.claim_current_by_article(chat_id, article, quantity)
+    except ArticleOcrError:
+        return (
+            "Не удалось распознать артикул в PDF. "
+            "Повтори запрос: уже распознанные страницы не потеряются."
+        )
+    if result.matched == 0:
+        return f"Свободные марки с артикулом '{article}' не найдены. Остаток: {result.available}."
+
+    if result.matched == 1:
+        location = result.locations[0]
+        caption = (
+            f"✅ Ваша марка найдена, её порядковый номер: {location.position_on_page} "
+            f"(№{location.position_on_page}). Лист {location.page_number}. "
+            f"Артикул: {location.article or article}. Свободно: {result.available}."
+        )
+    else:
+        positions = "; ".join(
+            f"{location.article or article}: лист {location.page_number}, №{location.position_on_page}"
+            for location in result.locations
+        )
+        caption = (
+            f"✅ По артикулу найдено и отмечено: {result.matched}. "
+            f"Позиции: {positions}. Свободно: {result.available}."
+        )
+    send_claimed_document(chat_id, result, caption)
     return caption
 
 
@@ -278,23 +394,48 @@ def get_chat_session(chat_id):
             "(num_shift_x_mm, num_shift_y_mm). ВАЖНО: 'сдвинуть нумерацию вверх на 2мм' означает num_shift_y_mm = 2.0. "
             "'сдвинуть вправо' означает num_shift_x_mm > 0. По умолчанию gap_x_mm=2.0, gap_y_mm=1.8. "
             "Если пользователь просит найти, выбрать или отметить марку по названию либо Data Matrix, вызывай "
-            "tool_find_marks. Для вопроса об остатках марок вызывай tool_marks_stats."
+            "tool_find_marks. Если пользователь ищет марку по артикулу и хочет узнать её номер на листе, "
+            "вызывай tool_find_article. Для вопроса об остатках марок вызывай tool_marks_stats. "
+            "Стиль общения: живой, с самоиронией и лёгким сарказмом уставшего, но любящего своё дело "
+            "айтишника-полиграфиста. Шути коротко и по делу, в духе резидентов Камеди Клаб, "
+            "можно вспоминать их типовые шутки и обыгрывать бытовые ситуации с серверами, печатью и дедлайнами. "
+            "Никогда не оскорбляй пользователя, не уходи в пошлость и не жертвуй точностью ответа ради шутки: "
+            "сначала суть и цифры, потом одна-две искры юмора."
         )
         user_chats[chat_id] = ai_client.chats.create(
             model=GEMINI_CHAT_MODEL,
             config=types.GenerateContentConfig(
                 system_instruction=persona,
-                tools=[tool_spusk_a3, tool_process_cz_archive, tool_find_marks, tool_marks_stats],
+                tools=[
+                    tool_spusk_a3,
+                    tool_process_cz_archive,
+                    tool_find_marks,
+                    tool_find_article,
+                    tool_marks_stats,
+                ],
             )
         )
     return user_chats[chat_id]
 
 # --- ОБРАБОТЧИКИ КОМАНД ---
 
+@bot.message_handler(commands=['help', 'commands'])
+@bot.message_handler(
+    func=lambda message: getattr(message, 'text', '') == HELP_BUTTON_TEXT,
+    content_types=['text'],
+)
+def handle_help(message):
+    bot.reply_to(message, HELP_TEXT, reply_markup=build_main_keyboard())
+
 @bot.message_handler(commands=['start', 'reset'])
 def send_welcome(message):
     user_chats.pop(message.chat.id, None)
-    bot.reply_to(message, "Контекст сброшен! Кидай архив ЧЗ и пиши, если нужно сдвинуть номера или зазоры.")
+    bot.reply_to(
+        message,
+        "Контекст сброшен! Кидай архив ЧЗ и пиши, если нужно сдвинуть номера или зазоры. "
+        "Полная справка — по кнопке ниже.",
+        reply_markup=build_main_keyboard(),
+    )
 
 @bot.message_handler(commands=['stats'])
 def handle_stats(message):
@@ -333,10 +474,81 @@ def handle_findmark(message):
         bot.reply_to(message, response)
 
 
+@bot.message_handler(commands=['findarticle', 'артикул'])
+def handle_findarticle(message):
+    set_active_chat_id(message.chat.id)
+    payload = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
+    if not payload:
+        bot.reply_to(message, "Использование: /findarticle [количество] <артикул>")
+        return
+
+    quantity = 1
+    article = payload
+    first, separator, remainder = payload.partition(" ")
+    if separator and first.isdigit():
+        quantity = max(1, min(int(first), MARKS_MAX_QUANTITY))
+        article = remainder.strip()
+    if not article:
+        bot.reply_to(message, "После количества укажи артикул.")
+        return
+
+    response = tool_find_article(article, quantity)
+    if not response.startswith("✅"):
+        bot.reply_to(message, response)
+
+
 @bot.message_handler(commands=['markstats', 'остаток'])
 def handle_markstats(message):
     set_active_chat_id(message.chat.id)
     bot.reply_to(message, tool_marks_stats())
+
+
+@bot.message_handler(commands=['unmark', 'вернуть'])
+def handle_unmark(message):
+    set_active_chat_id(message.chat.id)
+    payload = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
+    if not payload:
+        bot.reply_to(message, "Использование: /unmark [количество] <код, название или артикул>")
+        return
+
+    quantity = 1
+    query = payload
+    first, separator, remainder = payload.partition(" ")
+    if separator and first.isdigit():
+        quantity = max(1, min(int(first), MARKS_MAX_QUANTITY))
+        query = remainder.strip()
+    if not query:
+        bot.reply_to(message, "После количества укажи код, название или артикул.")
+        return
+
+    released = marks_store.unselect_marks(message.chat.id, query, quantity)
+    if released:
+        stats = marks_store.stats(message.chat.id)
+        bot.reply_to(
+            message,
+            f"✅ Вернул в базу: {released} марк(и). Свободно теперь: {stats.available}.",
+        )
+    else:
+        bot.reply_to(
+            message,
+            "Не нашёл выбранных марок по этому запросу. Проверь код, название или артикул.",
+        )
+
+
+@bot.message_handler(commands=['export', 'экспорт'])
+def handle_export(message):
+    set_active_chat_id(message.chat.id)
+    csv_bytes = marks_store.export_selected_marks(message.chat.id)
+    if csv_bytes is None:
+        bot.reply_to(message, "Нет выбранных марок для выгрузки.")
+        return
+    export_file = io.BytesIO(csv_bytes)
+    export_file.name = f"selected_marks_{message.chat.id}.csv"
+    bot.send_document(
+        message.chat.id,
+        export_file,
+        caption="Выбранные марки в CSV: артикул, название, лист, позиция, время выбора.",
+    )
 
 
 # НОВАЯ КОМАНДА: РИСОВАНИЕ КАРТИНОК (ДОЛЖНА БЫТЬ ВЫШЕ TEXT!)
@@ -390,6 +602,23 @@ def handle_media(message):
         return
     try:
         data = bot.download_file(bot.get_file(media.file_id).file_path)
+        if message.content_type == 'photo':
+            detected_codes = marks_store.decode_image(data)
+            if len(detected_codes) > 1:
+                bot.reply_to(
+                    message,
+                    "На фото распознано несколько Data Matrix. Отправь крупным планом только один код, "
+                    "чтобы случайно не выбрать лишнюю марку.",
+                )
+                return
+            if len(detected_codes) == 1:
+                response = tool_find_marks(detected_codes[0], quantity=1)
+                if not response.startswith("✅"):
+                    bot.reply_to(
+                        message,
+                        "Data Matrix распознан, но свободная марка с таким кодом в базе не найдена.",
+                    )
+                return
         mime = "image/jpeg" if message.content_type == 'photo' else "video/mp4"
         prompt = message.caption or "Изучи файл."
         thinking_msg = bot.reply_to(message, "<blockquote>⚙️ Мозгую варианты...</blockquote>", parse_mode="HTML")
@@ -418,6 +647,15 @@ def handle_doc(message):
         
     try:
         data = bot.download_file(bot.get_file(doc.file_id).file_path)
+
+        if fname.endswith('.csv'):
+            result = marks_store.import_search_index_csv(chat_id, orig, data)
+            bot.reply_to(
+                message,
+                f"✅ Текстовый индекс импортирован: {result.imported} из "
+                f"{result.total_rows}. Не сопоставлено: {result.unmatched}.",
+            )
+            return
 
         marks_response = register_marks_document(
             chat_id=chat_id,
@@ -479,6 +717,20 @@ def handle_doc(message):
 def handle_text(message):
     chat_id = message.chat.id
     set_active_chat_id(chat_id)
+    if (message.text or "").strip().lower() in CANCEL_WORDS:
+        if pending_suggestions.pop(chat_id, None) is not None:
+            bot.reply_to(message, "Отменил. Что ищем дальше?")
+        else:
+            bot.reply_to(message, "Нечего отменять — поиска в ожидании нет.")
+        return
+    article = extract_plain_article(message.text)
+    if article:
+        response = tool_find_article(article)
+        if response.startswith("✅"):
+            pending_suggestions.pop(chat_id, None)
+        else:
+            bot.reply_to(message, response)
+        return
     try:
         thinking_msg = bot.reply_to(message, "<blockquote>⚙️ Думаю...</blockquote>", parse_mode="HTML")
         resp = call_with_503_retry(
@@ -490,8 +742,104 @@ def handle_text(message):
     except Exception as e:
         handle_ai_error(e, chat_id, message, None)
 
-print("Бот СЕНЯ (С умным пониманием команд, генерацией ИИ-картинок и ЧЗ) запущен!")
-bot.infinity_polling(
-    timeout=TELEGRAM_POLLING_TIMEOUT,
-    long_polling_timeout=TELEGRAM_LONG_POLLING_TIMEOUT,
-)
+def transcribe_voice(voice_bytes: bytes) -> str:
+    """Переводит голосовое сообщение в текст через Gemini (аудио вход)."""
+    resp = call_with_503_retry(
+        ai_client.models.generate_content,
+        model=GEMINI_CHAT_MODEL,
+        contents=[
+            types.Part.from_bytes(data=voice_bytes, mime_type="audio/ogg"),
+            (
+                "Прослушай голосовое сообщение и верни ТОЛЬКО его текст дословно, "
+                "без комментариев, пояснений и кавычек. Если речи нет или не разобрать — "
+                "верни пустую строку."
+            ),
+        ],
+    )
+    update_stats(resp)
+    return (resp.text or "").strip()
+
+
+@bot.message_handler(content_types=['voice'])
+def handle_voice(message):
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
+    thinking_msg = None
+    voice = message.voice
+    if voice.file_size and voice.file_size > MAX_FILE_SIZE:
+        bot.reply_to(message, "⚠️ Голосовое тяжелее 20 МБ, Телега не даст скачать!")
+        return
+    try:
+        data = bot.download_file(bot.get_file(voice.file_id).file_path)
+        text = transcribe_voice(data)
+        if not text:
+            bot.reply_to(
+                message,
+                "Не расслышал ни слова. Повтори голосовое или напиши текстом.",
+            )
+            return
+        article = extract_plain_article(text)
+        if article:
+            response = tool_find_article(article)
+            if not response.startswith("✅"):
+                bot.reply_to(message, response)
+            return
+        response = tool_find_marks(text, quantity=1)
+        if response.startswith("✅"):
+            return
+        similar = marks_store.suggest_similar(chat_id, text)
+        if similar:
+            pending_suggestions[chat_id] = similar
+            variants = "\n".join(f"— {name}" for name in similar)
+            bot.reply_to(
+                message,
+                f"Точно «{text}» не нашёл, но есть похожие:\n{variants}\n\n"
+                f"Уточни, какой именно нужен, скажи артикул, или «отмена».",
+            )
+            return
+        thinking_msg = bot.reply_to(
+            message,
+            f"<blockquote>🎙 Расслышал: «{text}». Уточняю...</blockquote>",
+            parse_mode="HTML",
+        )
+        resp = call_with_503_retry(
+            get_chat_session(chat_id).send_message,
+            text,
+        )
+        update_stats(resp)
+        if resp.text: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+    except Exception as e:
+        handle_ai_error(e, chat_id, message, thinking_msg)
+
+
+def configure_bot_commands():
+    bot.set_my_commands(
+        [
+            telebot.types.BotCommand("help", "Что умеет Сеня и список команд"),
+            telebot.types.BotCommand("findmark", "Найти марку по коду или названию"),
+            telebot.types.BotCommand("findarticle", "Найти марку по артикулу и номеру на листе"),
+            telebot.types.BotCommand("markstats", "Остаток свободных марок"),
+            telebot.types.BotCommand("unmark", "Вернуть ошибочно выбранные марки"),
+            telebot.types.BotCommand("export", "Выгрузить выбранные марки в CSV"),
+            telebot.types.BotCommand("draw", "Нарисовать изображение"),
+            telebot.types.BotCommand("spusk", "A3-раскладка последнего PDF"),
+            telebot.types.BotCommand("stats", "Статистика запросов Gemini"),
+            telebot.types.BotCommand("reset", "Сбросить диалоговый контекст"),
+        ]
+    )
+
+
+def run_bot():
+    try:
+        configure_bot_commands()
+    except Exception as error:
+        print(f"Не удалось обновить меню команд Telegram: {error}")
+    print("Бот СЕНЯ (С умным пониманием команд, генерацией ИИ-картинок и ЧЗ) запущен!")
+    bot.infinity_polling(
+        timeout=TELEGRAM_POLLING_TIMEOUT,
+        long_polling_timeout=TELEGRAM_LONG_POLLING_TIMEOUT,
+    )
+
+
+if __name__ == "__main__":
+    run_bot()

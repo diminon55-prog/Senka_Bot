@@ -2,6 +2,7 @@ import unittest
 import threading
 from types import SimpleNamespace
 
+from marks_inventory import ArticleOcrError
 from test_bot_retry import load_bot_module
 
 
@@ -14,7 +15,13 @@ class FakeMarksStore:
 
     def import_pdf(self, chat_id, file_name, pdf_bytes, product_name=None):
         self.import_calls.append((chat_id, file_name, pdf_bytes, product_name))
-        return SimpleNamespace(imported=2, total=2, available=2, duplicate=False)
+        return SimpleNamespace(
+            document_id=314,
+            imported=2,
+            total=2,
+            available=2,
+            duplicate=False,
+        )
 
 
 class FakeSendingBot:
@@ -40,7 +47,144 @@ class FakeDocumentBot:
         self.replies.append(text)
 
 
+class FakePhotoBot:
+    def __init__(self, payload):
+        self.payload = payload
+        self.replies = []
+
+    def get_file(self, file_id):
+        return SimpleNamespace(file_path="telegram/photo.jpg")
+
+    def download_file(self, file_path):
+        return self.payload
+
+    def reply_to(self, message, text, **kwargs):
+        self.replies.append((text, kwargs))
+        return SimpleNamespace(message_id=1)
+
+
+class FakeRuntimeBot:
+    def __init__(self):
+        self.commands = []
+        self.polling_kwargs = None
+
+    def set_my_commands(self, commands):
+        self.commands = commands
+
+    def infinity_polling(self, **kwargs):
+        self.polling_kwargs = kwargs
+
+
 class BotMarksIntegrationTests(unittest.TestCase):
+    def test_help_command_lists_features_and_shows_persistent_button(self):
+        bot_module = load_bot_module()
+        help_bot = FakePhotoBot(b"")
+        bot_module.bot = help_bot
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/help")
+
+        bot_module.handle_help(message)
+
+        self.assertEqual(len(help_bot.replies), 1)
+        help_text, kwargs = help_bot.replies[0]
+        self.assertIn("/findmark", help_text)
+        self.assertIn("/findarticle", help_text)
+        self.assertIn("/markstats", help_text)
+        self.assertIn("/draw", help_text)
+        self.assertIn("Data Matrix", help_text)
+        self.assertIn("CSV", help_text)
+        keyboard = kwargs["reply_markup"].keyboard
+        button_texts = {button["text"] for row in keyboard for button in row}
+        self.assertIn(bot_module.HELP_BUTTON_TEXT, button_texts)
+
+    def test_start_command_attaches_help_button(self):
+        bot_module = load_bot_module()
+        welcome_bot = FakePhotoBot(b"")
+        bot_module.bot = welcome_bot
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/start")
+
+        bot_module.send_welcome(message)
+
+        self.assertEqual(len(welcome_bot.replies), 1)
+        reply_markup = welcome_bot.replies[0][1].get("reply_markup")
+        self.assertIsNotNone(reply_markup)
+        button_texts = {
+            button["text"]
+            for row in reply_markup.keyboard
+            for button in row
+        }
+        self.assertIn(bot_module.HELP_BUTTON_TEXT, button_texts)
+
+    def test_run_bot_registers_command_menu_before_polling(self):
+        bot_module = load_bot_module()
+        runtime_bot = FakeRuntimeBot()
+        bot_module.bot = runtime_bot
+
+        bot_module.run_bot()
+
+        command_names = {command.command for command in runtime_bot.commands}
+        self.assertTrue(
+            {"help", "findmark", "findarticle", "markstats", "draw", "spusk", "reset"}
+            <= command_names
+        )
+        self.assertEqual(
+            runtime_bot.polling_kwargs,
+            {
+                "timeout": bot_module.TELEGRAM_POLLING_TIMEOUT,
+                "long_polling_timeout": bot_module.TELEGRAM_LONG_POLLING_TIMEOUT,
+            },
+        )
+
+    def test_photo_with_one_datamatrix_claims_matching_mark_without_gemini(self):
+        bot_module = load_bot_module()
+        photo_bot = FakePhotoBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(
+            decode_image=lambda payload: ["PHOTO-MARK-001"]
+        )
+        claims = []
+        bot_module.tool_find_marks = lambda query, quantity=1: (
+            claims.append((query, quantity))
+            or "✅ Найдено и отмечено: 1. Свободно: 9."
+        )
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Фото с Data Matrix не должно отправляться в Gemini"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+        )
+
+        bot_module.handle_media(message)
+
+        self.assertEqual(claims, [("PHOTO-MARK-001", 1)])
+        self.assertEqual(bot_module.active_chat_id, 77)
+
+    def test_photo_with_multiple_datamatrix_codes_does_not_consume_marks(self):
+        bot_module = load_bot_module()
+        photo_bot = FakePhotoBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(
+            decode_image=lambda payload: ["PHOTO-MARK-001", "PHOTO-MARK-002"]
+        )
+        bot_module.tool_find_marks = lambda *args, **kwargs: self.fail(
+            "При нескольких кодах нельзя автоматически выбирать марку"
+        )
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Фото с несколькими Data Matrix не должно отправляться в Gemini"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+        )
+
+        bot_module.handle_media(message)
+
+        self.assertEqual(len(photo_bot.replies), 1)
+        self.assertIn("несколько", photo_bot.replies[0][0].casefold())
+        self.assertIn("один", photo_bot.replies[0][0].casefold())
+
     def test_register_marks_document_uses_caption_name_and_reports_stock(self):
         bot_module = load_bot_module()
         fake_store = FakeMarksStore()
@@ -83,6 +227,132 @@ class BotMarksIntegrationTests(unittest.TestCase):
             [(77, "ready_marks_marked.pdf", b"%PDF-marked", "✅ Найдено и отмечено: 1. Свободно: 9.")],
         )
 
+    def test_tool_find_marks_routes_covani_article_to_article_search(self):
+        bot_module = load_bot_module()
+        bot_module.active_chat_id = 77
+        calls = []
+        bot_module.tool_find_article = lambda article, quantity=1: (
+            calls.append((article, quantity))
+            or "✅ Ваша марка найдена, её порядковый номер: 2."
+        )
+        bot_module.marks_store = SimpleNamespace(
+            claim=lambda *args, **kwargs: self.fail(
+                "Артикул COVANI не должен идти по обычному поиску кода"
+            )
+        )
+
+        response = bot_module.tool_find_marks("COVANI SMS25-BHLM3-015H")
+
+        self.assertTrue(response.startswith("✅"))
+        self.assertEqual(calls, [("COVANI SMS25-BHLM3-015H", 1)])
+
+    def test_tool_find_article_reports_position_on_sheet(self):
+        bot_module = load_bot_module()
+        sending_bot = FakeSendingBot()
+        bot_module.bot = sending_bot
+        bot_module.active_chat_id = 77
+        bot_module.marks_store = SimpleNamespace(
+            claim_current_by_article=lambda chat_id, article, quantity: SimpleNamespace(
+                matched=1,
+                available=9,
+                pdf_bytes=b"%PDF-marked",
+                output_name="ready_marks_marked.pdf",
+                locations=(
+                    SimpleNamespace(
+                        article="COVANI SMS25-BHLM3-015H",
+                        page_number=2,
+                        position_on_page=17,
+                    ),
+                ),
+            )
+        )
+
+        response = bot_module.tool_find_article("COVANI SMS25-BHLM3")
+
+        self.assertIn("Ваша марка найдена, её порядковый номер: 17", response)
+        self.assertIn("COVANI SMS25-BHLM3-015H", response)
+        self.assertIn("лист 2", response.casefold())
+        self.assertIn("№17", response)
+        self.assertIn("9", response)
+        self.assertEqual(len(sending_bot.documents), 1)
+        self.assertEqual(sending_bot.documents[0][0], 77)
+        self.assertEqual(sending_bot.documents[0][1], "ready_marks_marked.pdf")
+
+    def test_tool_find_article_reports_retryable_ocr_error_without_sending_pdf(self):
+        bot_module = load_bot_module()
+        sending_bot = FakeSendingBot()
+        bot_module.bot = sending_bot
+        bot_module.active_chat_id = 77
+
+        def fail_ocr(chat_id, article, quantity):
+            raise ArticleOcrError("Tesseract internal details")
+
+        bot_module.marks_store = SimpleNamespace(claim_current_by_article=fail_ocr)
+
+        response = bot_module.tool_find_article("COVANI SMS25-BHLM3")
+
+        self.assertIn("распознать", response.casefold())
+        self.assertIn("повтори", response.casefold())
+        self.assertNotIn("internal", response.casefold())
+        self.assertEqual(sending_bot.documents, [])
+
+    def test_tool_find_article_limits_search_to_current_document(self):
+        bot_module = load_bot_module()
+        bot_module.active_chat_id = 77
+        calls = []
+
+        def claim_current_by_article(chat_id, article, quantity):
+            calls.append((chat_id, article, quantity))
+            return SimpleNamespace(matched=0, available=4)
+
+        bot_module.marks_store = SimpleNamespace(
+            claim_current_by_article=claim_current_by_article,
+        )
+
+        bot_module.tool_find_article("COVANI SMS25-BHLM3")
+
+        self.assertEqual(calls, [(77, "COVANI SMS25-BHLM3", 1)])
+
+    def test_tool_find_article_releases_claim_when_document_send_fails(self):
+        bot_module = load_bot_module()
+
+        class FailingSendingBot:
+            def send_document(self, chat_id, document, caption=None):
+                raise RuntimeError("telegram upload failed")
+
+        releases = []
+        confirmations = []
+        bot_module.bot = FailingSendingBot()
+        bot_module.active_chat_id = 77
+        bot_module.marks_store = SimpleNamespace(
+            claim_current_by_article=lambda chat_id, article, quantity: SimpleNamespace(
+                matched=1,
+                available=9,
+                pdf_bytes=b"%PDF-marked",
+                output_name="ready_marks_marked.pdf",
+                claim_token="claim-123",
+                locations=(
+                    SimpleNamespace(
+                        article="COVANI SMS25-BHLM3-015H",
+                        page_number=1,
+                        position_on_page=5,
+                    ),
+                ),
+            ),
+            release_claim=lambda chat_id, claim_token: releases.append(
+                (chat_id, claim_token)
+            ),
+            finalize_claim=lambda chat_id, claim_token: confirmations.append(
+                (chat_id, claim_token)
+            ),
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "telegram upload failed"):
+            bot_module.tool_find_article("COVANI SMS25-BHLM3")
+
+        self.assertEqual(releases, [(77, "claim-123")])
+        self.assertEqual(confirmations, [])
+
     def test_tool_marks_stats_reports_total_selected_and_available(self):
         bot_module = load_bot_module()
         bot_module.active_chat_id = 77
@@ -113,6 +383,7 @@ class BotMarksIntegrationTests(unittest.TestCase):
         tools = captured["config"].tools
         names = {getattr(tool, "__name__", "") for tool in tools}
         self.assertIn("tool_find_marks", names)
+        self.assertIn("tool_find_article", names)
         self.assertIn("tool_marks_stats", names)
 
     def test_document_handler_registers_marks_pdf_before_standard_layout(self):
@@ -140,6 +411,37 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertEqual(calls[0]["pdf_bytes"], b"ready-pdf")
         self.assertEqual(document_bot.replies, ["Марок: 2. Свободно: 2."])
 
+    def test_document_handler_imports_csv_search_index_for_current_pdf(self):
+        bot_module = load_bot_module()
+        document_bot = FakeDocumentBot(b"csv-index-data")
+        bot_module.bot = document_bot
+        calls = []
+        bot_module.marks_store = SimpleNamespace(
+            import_search_index_csv=lambda chat_id, file_name, csv_bytes: (
+                calls.append((chat_id, file_name, csv_bytes))
+                or SimpleNamespace(imported=721, unmatched=0, total_rows=721)
+            )
+        )
+        bot_module.register_marks_document = lambda **kwargs: self.fail(
+            "CSV не должен проходить через распознавание PDF"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            document=SimpleNamespace(
+                file_name="marks_index.csv",
+                file_size=100,
+                file_id="csv-file-id",
+            ),
+            caption=None,
+        )
+
+        bot_module.handle_doc(message)
+
+        self.assertEqual(calls, [(77, "marks_index.csv", b"csv-index-data")])
+        self.assertEqual(len(document_bot.replies), 1)
+        self.assertIn("721", document_bot.replies[0])
+        self.assertIn("индекс", document_bot.replies[0].casefold())
+
     def test_findmark_command_parses_quantity_and_query(self):
         bot_module = load_bot_module()
         command_bot = FakeDocumentBot(b"")
@@ -157,6 +459,81 @@ class BotMarksIntegrationTests(unittest.TestCase):
 
         self.assertEqual(calls, [("Зелёные футболки", 2)])
         self.assertEqual(bot_module.active_chat_id, 77)
+
+    def test_findarticle_command_parses_quantity_and_article(self):
+        bot_module = load_bot_module()
+        command_bot = FakeDocumentBot(b"")
+        bot_module.bot = command_bot
+        calls = []
+        bot_module.tool_find_article = lambda article, quantity=1: (
+            calls.append((article, quantity))
+            or "✅ По артикулу найдено и отмечено: 2. Позиции: лист 1, №2; лист 1, №3."
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            text="/findarticle 2 COVANI SMS25-BHLM3",
+        )
+
+        bot_module.handle_findarticle(message)
+
+        self.assertEqual(calls, [("COVANI SMS25-BHLM3", 2)])
+        self.assertEqual(bot_module.active_chat_id, 77)
+
+    def test_plain_article_text_uses_local_search_without_gemini(self):
+        bot_module = load_bot_module()
+        command_bot = FakeDocumentBot(b"")
+        bot_module.bot = command_bot
+        calls = []
+        bot_module.tool_find_article = lambda article, quantity=1: (
+            calls.append((article, quantity))
+            or "✅ Ваша марка найдена, её порядковый номер: 5."
+        )
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Артикул должен обрабатываться локально без Gemini"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            text="COVANI SMS25-BHLM3",
+        )
+
+        bot_module.handle_text(message)
+
+        self.assertEqual(calls, [("COVANI SMS25-BHLM3", 1)])
+        self.assertEqual(bot_module.active_chat_id, 77)
+        self.assertEqual(command_bot.replies, [])
+
+    def test_plain_article_classifier_requires_letters_and_digits(self):
+        bot_module = load_bot_module()
+
+        self.assertEqual(
+            bot_module.extract_plain_article("COVANI SMS25-BHLM3"),
+            "COVANI SMS25-BHLM3",
+        )
+        self.assertEqual(
+            bot_module.extract_plain_article("SMS25-BHLM3"),
+            "SMS25-BHLM3",
+        )
+        self.assertEqual(bot_module.extract_plain_article("HELLO-WORLD"), "")
+        self.assertEqual(bot_module.extract_plain_article("123-456"), "")
+
+    def test_gemini_persona_keeps_dry_humor_style(self):
+        bot_module = load_bot_module()
+        created_configs = []
+        bot_module.ai_client = SimpleNamespace(
+            chats=SimpleNamespace(
+                create=lambda model, config: (
+                    created_configs.append(config) or SimpleNamespace()
+                )
+            )
+        )
+
+        bot_module.get_chat_session(4242)
+
+        self.assertEqual(len(created_configs), 1)
+        persona = created_configs[0].system_instruction
+        self.assertIn("Сеня", persona)
+        self.assertIn("шут", persona.lower())
+        self.assertIn("Камеди", persona)
 
     def test_active_chat_context_is_isolated_between_worker_threads(self):
         bot_module = load_bot_module()
@@ -176,6 +553,273 @@ class BotMarksIntegrationTests(unittest.TestCase):
         second.join()
 
         self.assertEqual(results, {101: 101, 202: 202})
+
+    def test_voice_with_article_routes_to_article_search(self):
+        bot_module = load_bot_module()
+        voice_bot = FakePhotoBot(b"voice-ogg-bytes")
+        bot_module.bot = voice_bot
+        bot_module.transcribe_voice = lambda data: "COVANI SMS25-BHLM3"
+        calls = []
+        bot_module.tool_find_article = lambda article, quantity=1: (
+            calls.append((article, quantity))
+            or "✅ Ваша марка найдена, её порядковый номер: 5."
+        )
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Голос с артикулом должен идти в локальный поиск без Gemini-диалога"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="voice",
+            voice=SimpleNamespace(file_id="voice-id", file_size=100),
+        )
+
+        bot_module.handle_voice(message)
+
+        self.assertEqual(calls, [("COVANI SMS25-BHLM3", 1)])
+        self.assertEqual(bot_module.active_chat_id, 77)
+
+    def test_voice_with_product_name_routes_to_find_marks(self):
+        bot_module = load_bot_module()
+        voice_bot = FakePhotoBot(b"voice-ogg-bytes")
+        bot_module.bot = voice_bot
+        bot_module.transcribe_voice = lambda data: "Босоножки COVANI DLT серые"
+        calls = []
+        bot_module.tool_find_marks = lambda query, quantity=1: (
+            calls.append((query, quantity))
+            or "✅ Найдено и отмечено: 1. Свободно: 719."
+        )
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Голос с названием должен идти в локальный поиск без Gemini-диалога"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="voice",
+            voice=SimpleNamespace(file_id="voice-id", file_size=100),
+        )
+
+        bot_module.handle_voice(message)
+
+        self.assertEqual(calls, [("Босоножки COVANI DLT серые", 1)])
+
+    def test_voice_fuzzy_match_offers_variants_without_selecting(self):
+        bot_module = load_bot_module()
+        voice_bot = FakePhotoBot(b"voice-ogg-bytes")
+        bot_module.bot = voice_bot
+        bot_module.transcribe_voice = lambda data: "Босоножки COVANI DLT серые"
+        calls = []
+
+        def fake_find_marks(query, quantity=1):
+            calls.append((query, quantity))
+            return f"Свободные марки с названием '{query}' не найдены."
+
+        bot_module.tool_find_marks = fake_find_marks
+        bot_module.marks_store = SimpleNamespace(
+            suggest_similar=lambda chat_id, query, limit=5: [
+                "Босоножки COVANI DLT- S26-WLM3-BM002-2 коричневый (41)",
+                "Босоножки COVANI DLT- S26-WLM3-BM003-2 бежевый кожа (36)",
+            ]
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="voice",
+            voice=SimpleNamespace(file_id="voice-id", file_size=100),
+        )
+
+        bot_module.handle_voice(message)
+
+        self.assertEqual(calls, [("Босоножки COVANI DLT серые", 1)])
+        self.assertEqual(len(voice_bot.replies), 1)
+        reply = voice_bot.replies[0][0]
+        self.assertIn("не наш", reply.lower())
+        self.assertIn("коричневый", reply)
+        self.assertIn("бежевый", reply)
+        self.assertIn("уточни", reply.lower())
+        self.assertIn(77, bot_module.pending_suggestions)
+
+    def test_cancel_text_clears_pending_suggestion(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.pending_suggestions[77] = ["Вариант А", "Вариант Б"]
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Отмена не должна уходить в Gemini-диалог"
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="отмена")
+
+        bot_module.handle_text(message)
+
+        self.assertNotIn(77, bot_module.pending_suggestions)
+        self.assertEqual(len(reply_bot.replies), 1)
+        self.assertIn("отменил", reply_bot.replies[0][0].lower())
+
+    def test_cancel_text_without_pending_reports_nothing_to_cancel(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.pending_suggestions.pop(77, None)
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="Отмена")
+
+        bot_module.handle_text(message)
+
+        self.assertEqual(len(reply_bot.replies), 1)
+        self.assertIn("нечего отменять", reply_bot.replies[0][0].lower())
+
+    def test_successful_mark_search_clears_pending_suggestion(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.pending_suggestions[77] = ["Вариант А"]
+        bot_module.tool_find_article = lambda article, quantity=1: (
+            "✅ Ваша марка найдена, её порядковый номер: 5."
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77), text="COVANI SMS25-BHLM3"
+        )
+
+        bot_module.handle_text(message)
+
+        self.assertNotIn(77, bot_module.pending_suggestions)
+
+    def test_voice_chat_falls_back_to_gemini_dialog(self):
+        bot_module = load_bot_module()
+        voice_bot = FakePhotoBot(b"voice-ogg-bytes")
+        bot_module.bot = voice_bot
+        bot_module.transcribe_voice = lambda data: "расскажи анекдот про печать"
+        sent_parts = []
+        session = SimpleNamespace(
+            send_message=lambda parts: (
+                sent_parts.append(parts)
+                or SimpleNamespace(text="Держи: принтер и сканер поспорили...")
+            )
+        )
+        bot_module.get_chat_session = lambda chat_id: session
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="voice",
+            voice=SimpleNamespace(file_id="voice-id", file_size=100),
+        )
+
+        bot_module.handle_voice(message)
+
+        self.assertEqual(len(sent_parts), 1)
+        self.assertEqual(sent_parts[0], "расскажи анекдот про печать")
+
+    def test_voice_reports_empty_transcription(self):
+        bot_module = load_bot_module()
+        voice_bot = FakePhotoBot(b"voice-ogg-bytes")
+        bot_module.bot = voice_bot
+        bot_module.transcribe_voice = lambda data: ""
+        bot_module.get_chat_session = lambda chat_id: self.fail(
+            "Пустая транскрипция не должна уходить в Gemini"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="voice",
+            voice=SimpleNamespace(file_id="voice-id", file_size=100),
+        )
+
+        bot_module.handle_voice(message)
+
+        self.assertEqual(len(voice_bot.replies), 1)
+        self.assertIn("не расслышал", voice_bot.replies[0][0].lower())
+
+    def test_unmark_command_releases_selected_marks_and_replies(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        calls = []
+        bot_module.marks_store = SimpleNamespace(
+            unselect_marks=lambda chat_id, query, quantity=1: (
+                calls.append((chat_id, query, quantity)) or 1
+            ),
+            stats=lambda chat_id: SimpleNamespace(available=10),
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            text="/unmark COVANI SMS25-BHLM3-015H",
+        )
+
+        bot_module.handle_unmark(message)
+
+        self.assertEqual(calls, [(77, "COVANI SMS25-BHLM3-015H", 1)])
+        self.assertEqual(len(reply_bot.replies), 1)
+        self.assertIn("вернул", reply_bot.replies[0][0].lower())
+
+    def test_unmark_command_parses_quantity(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        calls = []
+        bot_module.marks_store = SimpleNamespace(
+            unselect_marks=lambda chat_id, query, quantity=1: (
+                calls.append((chat_id, query, quantity)) or quantity
+            ),
+            stats=lambda chat_id: SimpleNamespace(available=10),
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            text="/unmark 3 Босоножки COVANI",
+        )
+
+        bot_module.handle_unmark(message)
+
+        self.assertEqual(calls, [(77, "Босоножки COVANI", 3)])
+
+    def test_unmark_command_reports_when_nothing_released(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.marks_store = SimpleNamespace(
+            unselect_marks=lambda chat_id, query, quantity=1: 0
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            text="/unmark нет такой марки",
+        )
+
+        bot_module.handle_unmark(message)
+
+        self.assertEqual(len(reply_bot.replies), 1)
+        self.assertIn("не наш", reply_bot.replies[0][0].lower())
+
+    def test_export_command_sends_csv_document(self):
+        bot_module = load_bot_module()
+        send_bot = FakeSendingBot()
+        send_bot.replies = []
+        send_bot.reply_to = lambda message, text, **kwargs: send_bot.replies.append(
+            text
+        )
+        bot_module.bot = send_bot
+        bot_module.marks_store = SimpleNamespace(
+            export_selected_marks=lambda chat_id: (
+                "Артикул;Название\nA;B\n".encode("utf-8-sig")
+            )
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/export")
+
+        bot_module.handle_export(message)
+
+        self.assertEqual(len(send_bot.documents), 1)
+        chat_id, name, payload, caption = send_bot.documents[0]
+        self.assertEqual(chat_id, 77)
+        self.assertTrue(name.endswith(".csv"))
+        self.assertTrue(payload.startswith(b"\xef\xbb\xbf"))
+
+    def test_export_command_reports_empty_selection(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.marks_store = SimpleNamespace(
+            export_selected_marks=lambda chat_id: None
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/export")
+
+        bot_module.handle_export(message)
+
+        self.assertEqual(len(reply_bot.replies), 1)
+        self.assertIn("нет выбранных", reply_bot.replies[0][0].lower())
 
 
 if __name__ == "__main__":

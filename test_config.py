@@ -22,6 +22,11 @@ class ConfigurationTests(unittest.TestCase):
         self.assertNotIn("bot_backup.py", source)
         self.assertIn("TELEGRAM_TOKEN", imported_names)
         self.assertIn("MARKS_DB_PATH", imported_names)
+        self.assertIn("MARKS_OCR_DPI", imported_names)
+        self.assertIn("MARKS_OCR_MAX_PAGES", imported_names)
+        self.assertIn("MARKS_OCR_TOTAL_TIMEOUT_SECONDS", imported_names)
+        self.assertIn("MARKS_TESSERACT_COMMAND", imported_names)
+        self.assertIn("MARKS_OCR_TIMEOUT_SECONDS", imported_names)
         self.assertIn("GEMINI_CHAT_MODEL", imported_names)
 
 
