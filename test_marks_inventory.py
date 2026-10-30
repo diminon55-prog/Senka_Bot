@@ -1877,6 +1877,143 @@ class MarksInventoryTests(unittest.TestCase):
 
             self.assertIsNone(inventory.export_selected_marks(42))
 
+    def test_reset_inventory_returns_all_marks_to_available(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = self._make_two_mark_inventory(Path(temp_dir))
+            claim = inventory.claim(42, "COVANI SMS25-BHLM3-015H")
+            inventory.finalize_claim(42, claim.claim_token)
+            claim2 = inventory.claim(42, "COVANI SMS25-BHLM3-017")
+            inventory.finalize_claim(42, claim2.claim_token)
+            self.assertEqual(inventory.stats(42).selected, 2)
+            self.assertEqual(inventory.stats(42).available, 0)
+
+            reset_count = inventory.reset_inventory(42)
+
+            self.assertEqual(reset_count, 2)
+            self.assertEqual(inventory.stats(42).selected, 0)
+            self.assertEqual(inventory.stats(42).available, 2)
+            with closing(sqlite3.connect(Path(temp_dir) / "marks.db")) as connection:
+                tokens = connection.execute(
+                    "SELECT COUNT(*) FROM marks WHERE claim_token <> '' OR selected_at IS NOT NULL"
+                ).fetchone()[0]
+            self.assertEqual(tokens, 0)
+
+    def test_reset_inventory_does_not_touch_other_chats(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = self._make_two_mark_inventory(Path(temp_dir))
+            inventory.import_pdf(
+                77,
+                "other.pdf",
+                make_marks_pdf(["MARK-OTHER-001"]),
+                "Чужие",
+            )
+            claim = inventory.claim(77, "MARK-OTHER-001")
+            inventory.finalize_claim(77, claim.claim_token)
+
+            inventory.reset_inventory(42)
+
+            self.assertEqual(inventory.stats(77).selected, 1)
+
+    def test_claim_by_article_prefix_rejects_ambiguous_base(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inventory = MarksInventory(
+                db_path=root / "marks.db",
+                storage_dir=root / "pdfs",
+                scan_dpi=200,
+                grid_columns=2,
+                grid_rows=1,
+                cell_width_pt=180,
+                cell_height_pt=180,
+            )
+            inventory.import_pdf(
+                42,
+                "marks.pdf",
+                make_marks_pdf(
+                    ["MARK-ALPHA-001", "MARK-BETA-002"],
+                    ["COVANI DLT-S26-WLM3-BM002", "COVANI DLT-S26-WLM3-BM003"],
+                ),
+                "Марки",
+            )
+
+            result = inventory.claim_current_by_article(42, "COVANI DLT-S26-WLM3")
+
+            self.assertEqual(result.matched, 0)
+            self.assertEqual(inventory.stats(42).selected, 0)
+
+    def test_selected_marks_by_query_finds_already_claimed_marks(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = self._make_two_mark_inventory(Path(temp_dir))
+            claim = inventory.claim(42, "COVANI SMS25-BHLM3-015H")
+            inventory.finalize_claim(42, claim.claim_token)
+
+            found = inventory.selected_marks_by_query(42, "COVANI SMS25-BHLM3-015H")
+
+            self.assertEqual(len(found), 1)
+            self.assertEqual(found[0].article, "COVANI SMS25-BHLM3-015H")
+            self.assertEqual(found[0].position_on_page, 1)
+
+    def test_selected_marks_by_query_returns_empty_when_nothing_selected(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = self._make_two_mark_inventory(Path(temp_dir))
+
+            self.assertEqual(
+                inventory.selected_marks_by_query(42, "COVANI SMS25-BHLM3-015H"),
+                [],
+            )
+
+    def test_find_available_by_article_returns_multiple_matches(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inventory = MarksInventory(
+                db_path=root / "marks.db",
+                storage_dir=root / "pdfs",
+                scan_dpi=200,
+                grid_columns=2,
+                grid_rows=1,
+                cell_width_pt=180,
+                cell_height_pt=180,
+            )
+            inventory.import_pdf(
+                42,
+                "marks.pdf",
+                make_marks_pdf(
+                    ["M1", "M2", "M3", "M4"],
+                    [
+                        "COVANI SMS25-BHLM3-017A",
+                        "COVANI SMS25-BHLM3-017A",
+                        "COVANI SMS25-BHLM3-017A",
+                        "COVANI SMS25-BHLM3-017A",
+                    ],
+                ),
+                "Марки",
+            )
+
+            found = inventory.find_available_by_article(42, "COVANI SMS25-BHLM3-017A")
+
+            self.assertEqual(len(found), 2)
+            self.assertEqual(found[0].article, "COVANI SMS25-BHLM3-017A")
+            self.assertEqual(found[0].position_on_page, 1)
+            self.assertEqual(found[1].position_on_page, 2)
+
+    def test_find_available_by_article_returns_empty_for_unknown(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = self._make_two_mark_inventory(Path(temp_dir))
+
+            found = inventory.find_available_by_article(42, "NO-SUCH-ARTICLE")
+
+            self.assertEqual(found, [])
+
+    def test_claim_specific_marks_selects_by_ids(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            inventory = self._make_two_mark_inventory(Path(temp_dir))
+
+            claim = inventory.claim_specific_marks(42, [1, 2])
+
+            self.assertEqual(claim.matched, 2)
+            self.assertEqual(claim.available, 0)
+            self.assertEqual(inventory.stats(42).selected, 2)
+
 
 if __name__ == "__main__":
     unittest.main()

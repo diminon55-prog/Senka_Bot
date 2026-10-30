@@ -1,4 +1,5 @@
 import os, re, zipfile, rarfile, io, telebot, time
+from pathlib import Path
 import pymupdf as fitz
 from contextvars import ContextVar
 from google import genai
@@ -78,7 +79,9 @@ HELP_TEXT = (
     "7. /markstats — показать общий остаток.\n"
     "8. /unmark [N] <код, название или артикул> — вернуть ошибочно выбранные марки "
     "в базу.\n"
-    "9. /export — выгрузить все выбранные марки в CSV для ревизии.\n\n"
+    "9. /export — выгрузить все выбранные марки в CSV для ревизии.\n"
+    "10. /resetmarks — сбросить все выбранные марки обратно в свободные.\n"
+    "11. /list — показать список выбранных марок таблицей.\n\n"
     "Другие команды:\n"
     "/stats — статистика запросов Gemini.\n"
     "/reset — сбросить только диалоговый контекст; база марок сохранится.\n"
@@ -117,6 +120,7 @@ def send_claimed_document(chat_id, result, caption):
 
 CANCEL_WORDS = frozenset({"отмена", "отменить", "отбой", "стоп", "хватит"})
 pending_suggestions: dict[int, list[str]] = {}
+pending_mark_selection: dict[int, list[int]] = {}
 
 marks_store = MarksInventory(
     db_path=MARKS_DB_PATH,
@@ -342,6 +346,21 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
     if not chat_id:
         return "ОШИБКА: Не удалось определить чат."
 
+    # Если количество не указано, проверяем множественные совпадения
+    if quantity == 1:
+        matches = marks_store.find_available_by_article(chat_id, article)
+        if len(matches) > 1:
+            pending_mark_selection[chat_id] = [m.id for m in matches]
+            lines = []
+            for idx, m in enumerate(matches, 1):
+                doc_name = f"doc_{m.document_id}"
+                lines.append(f"{idx}. {m.display_name or m.article} (лист {m.page_number}, №{m.position_on_page}, {doc_name})")
+            return (
+                f"По артикулу '{article}' найдено {len(matches)} марок:\n"
+                + "\n".join(lines)
+                + "\n\nВведи номер (1, 2...), несколько номеров через запятую, или «все»."
+            )
+
     try:
         result = marks_store.claim_current_by_article(chat_id, article, quantity)
     except ArticleOcrError:
@@ -350,23 +369,40 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
             "Повтори запрос: уже распознанные страницы не потеряются."
         )
     if result.matched == 0:
-        return f"Свободные марки с артикулом '{article}' не найдены. Остаток: {result.available}."
+        selected = marks_store.selected_marks_by_query(chat_id, article)
+        if selected:
+            first = selected[0]
+            return (
+                f"⚠️ Марка '{article}' уже выбрана ранее: лист {first.page_number}, "
+                f"№{first.position_on_page}. Если нужно вернуть её в базу — "
+                f"/unmark {article}. Остаток: {result.available}."
+            )
+        return (
+            f"Свободные марки с артикулом '{article}' не найдены — "
+            f"все уже выбраны или закончились. "
+            f"Если нужно вернуть выбранные, скажи /unmark или /resetmarks. "
+            f"Остаток: {result.available}."
+        )
 
     if result.matched == 1:
         location = result.locations[0]
+        source_name = Path(str(result.output_name)).stem.replace("_marked", "")
         caption = (
             f"✅ Ваша марка найдена, её порядковый номер: {location.position_on_page} "
             f"(№{location.position_on_page}). Лист {location.page_number}. "
-            f"Артикул: {location.article or article}. Свободно: {result.available}."
+            f"Артикул: {location.article or article}. "
+            f"Источник: {source_name}. "
+            f"Свободно: {result.available}."
         )
     else:
         positions = "; ".join(
             f"{location.article or article}: лист {location.page_number}, №{location.position_on_page}"
             for location in result.locations
         )
+        source_name = Path(str(result.output_name)).stem.replace("_marked", "")
         caption = (
             f"✅ По артикулу найдено и отмечено: {result.matched}. "
-            f"Позиции: {positions}. Свободно: {result.available}."
+            f"Позиции: {positions}. Источник: {source_name}. Свободно: {result.available}."
         )
     send_claimed_document(chat_id, result, caption)
     return caption
@@ -551,6 +587,41 @@ def handle_export(message):
     )
 
 
+@bot.message_handler(commands=['resetmarks', 'сброс'])
+def handle_resetmarks(message):
+    set_active_chat_id(message.chat.id)
+    released = marks_store.reset_inventory(message.chat.id)
+    if released:
+        stats = marks_store.stats(message.chat.id)
+        bot.reply_to(
+            message,
+            f"✅ Сбросил {released} выбранных марок. Свободно теперь: {stats.available}.",
+        )
+    else:
+        bot.reply_to(message, "Нет выбранных марок для сброса.")
+
+
+@bot.message_handler(commands=['list', 'список'])
+def handle_list(message):
+    set_active_chat_id(message.chat.id)
+    csv_bytes = marks_store.export_selected_marks(message.chat.id)
+    if csv_bytes is None:
+        bot.reply_to(message, "Нет выбранных марок.")
+        return
+    text = csv_bytes.decode("utf-8-sig")
+    lines = text.strip().split("\n")
+    if len(lines) <= 1:
+        bot.reply_to(message, "Нет выбранных марок.")
+        return
+    header = lines[0].split(";")
+    rows = [line.split(";") for line in lines[1:]]
+    table = [" | ".join(header)]
+    table.append("-" * len(table[0]))
+    for row in rows:
+        table.append(" | ".join(row[:4]))
+    bot.reply_to(message, "Выбранные марки:\n\n" + "\n".join(table))
+
+
 # НОВАЯ КОМАНДА: РИСОВАНИЕ КАРТИНОК (ДОЛЖНА БЫТЬ ВЫШЕ TEXT!)
 @bot.message_handler(commands=['draw', 'рисуй'])
 def handle_draw(message):
@@ -627,7 +698,32 @@ def handle_media(message):
             [types.Part.from_bytes(data=data, mime_type=mime), prompt],
         )
         update_stats(resp)
-        if resp.text: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+        if resp.text:
+            bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+            # Ищем марку по тексту ответа Gemini: сначала артикул, потом название
+            article_match = re.search(
+                r"(?:артикул|article)[:\s]*([A-Z0-9][A-Z0-9\-/\.]{3,20})",
+                resp.text,
+                re.IGNORECASE,
+            )
+            query = article_match.group(1).strip() if article_match else resp.text.strip()
+            # Сначала ищем по названию (включая mark_text_index)
+            response = tool_find_marks(query, quantity=1)
+            if response.startswith("✅"):
+                bot.reply_to(message, response)
+            else:
+                # Потом пробуем как артикул, но без OCR — только по уже распознанным
+                try:
+                    article_response = tool_find_article(query)
+                except ArticleOcrError:
+                    article_response = "OCR не завершён"
+                if article_response.startswith("✅"):
+                    bot.reply_to(message, article_response)
+                else:
+                    bot.reply_to(
+                        message,
+                        f"Марка «{query}» в базе не найдена — свободных нет.",
+                    )
     except Exception as e:
         handle_ai_error(e, chat_id, message, thinking_msg)
 
@@ -720,11 +816,56 @@ def handle_text(message):
     if (message.text or "").strip().lower() in CANCEL_WORDS:
         if pending_suggestions.pop(chat_id, None) is not None:
             bot.reply_to(message, "Отменил. Что ищем дальше?")
+        elif pending_mark_selection.pop(chat_id, None) is not None:
+            bot.reply_to(message, "Отменил выбор марок. Что ищем дальше?")
         else:
             bot.reply_to(message, "Нечего отменять — поиска в ожидании нет.")
         return
+    # Проверяем, не выбирает ли пользователь номера марок из списка
+    if chat_id in pending_mark_selection:
+        text_lower = message.text.strip().lower()
+        if text_lower in ("все", "всё", "all"):
+            selected_ids = pending_mark_selection.pop(chat_id)
+            result = marks_store.claim_specific_marks(chat_id, selected_ids)
+            if result.matched:
+                source_name = Path(str(result.output_name)).stem.replace("_marked", "")
+                caption = (
+                    f"✅ Отмечено марок: {result.matched}. "
+                    f"Источник: {source_name}. Свободно: {result.available}."
+                )
+                send_claimed_document(chat_id, result, caption)
+            return
+        # Парсим номера
+        numbers = []
+        for part in text_lower.replace(",", " ").split():
+            if part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(pending_mark_selection[chat_id]):
+                    numbers.append(idx)
+        if numbers:
+            selected_ids = [pending_mark_selection[chat_id][i-1] for i in numbers]
+            pending_mark_selection.pop(chat_id)
+            result = marks_store.claim_specific_marks(chat_id, selected_ids)
+            if result.matched:
+                source_name = Path(str(result.output_name)).stem.replace("_marked", "")
+                positions = "; ".join(
+                    f"{loc.article}: лист {loc.page_number}, №{loc.position_on_page}"
+                    for loc in result.locations
+                )
+                caption = (
+                    f"✅ Отмечено марок: {result.matched}. "
+                    f"Позиции: {positions}. Источник: {source_name}. Свободно: {result.available}."
+                )
+                send_claimed_document(chat_id, result, caption)
+            return
     article = extract_plain_article(message.text)
     if article:
+        # Сначала ищем по названию (включая mark_text_index) — быстрее и без OCR
+        response = tool_find_marks(article, quantity=1)
+        if response.startswith("✅"):
+            pending_suggestions.pop(chat_id, None)
+            return
+        # Если не нашли по названию — пробуем как артикул
         response = tool_find_article(article)
         if response.startswith("✅"):
             pending_suggestions.pop(chat_id, None)
@@ -821,6 +962,8 @@ def configure_bot_commands():
             telebot.types.BotCommand("markstats", "Остаток свободных марок"),
             telebot.types.BotCommand("unmark", "Вернуть ошибочно выбранные марки"),
             telebot.types.BotCommand("export", "Выгрузить выбранные марки в CSV"),
+            telebot.types.BotCommand("resetmarks", "Сбросить все выбранные марки"),
+            telebot.types.BotCommand("list", "Показать список выбранных марок"),
             telebot.types.BotCommand("draw", "Нарисовать изображение"),
             telebot.types.BotCommand("spusk", "A3-раскладка последнего PDF"),
             telebot.types.BotCommand("stats", "Статистика запросов Gemini"),

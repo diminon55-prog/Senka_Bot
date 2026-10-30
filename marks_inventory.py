@@ -64,6 +64,24 @@ class ClaimResult:
     claim_token: str = ""
 
 
+@dataclass(frozen=True)
+class AvailableMarkInfo:
+    id: int
+    article: str
+    page_number: int
+    position_on_page: int
+    display_name: str
+    document_id: int
+
+
+@dataclass(frozen=True)
+class SelectedMarkInfo:
+    article: str
+    page_number: int
+    position_on_page: int
+    selected_at: str
+
+
 class ArticleOcrError(RuntimeError):
     pass
 
@@ -1231,39 +1249,70 @@ class MarksInventory:
 
         with self._connection() as connection:
             connection.execute("BEGIN IMMEDIATE")
-            document_row = connection.execute(
-                """
-                SELECT d.*
-                FROM documents d
-                WHERE d.chat_id = ?
-                  AND (? IS NULL OR d.id = ?)
-                  AND EXISTS (
-                      SELECT 1 FROM marks m
-                      LEFT JOIN mark_text_index i ON i.mark_id = m.id
-                      WHERE m.document_id = d.id
-                        AND m.status = 'available'
-                        AND (
-                            (? = 1 AND (
-                                m.normalized_article = ?
-                                OR m.normalized_article LIKE ? ESCAPE '!'
-                                OR m.normalized_article = ?
-                                OR m.normalized_article LIKE ? ESCAPE '!'
-                            ))
-                            OR (? = 0 AND (
-                                m.normalized_code = ?
-                                OR m.normalized_code LIKE ? ESCAPE '!'
-                                OR m.normalized_article LIKE ? ESCAPE '!'
-                                OR i.normalized_display_name LIKE ? ESCAPE '!'
-                                OR i.normalized_short_code LIKE ? ESCAPE '!'
-                                OR (? = 1 AND d.search_name LIKE ? ESCAPE '!')
-                            ))
-                        )
-                  )
-                ORDER BY d.id DESC
-                LIMIT 1
-                """,
-                (chat_id, document_id, document_id, *match_values),
-            ).fetchone()
+            if document_id is None:
+                document_row = connection.execute(
+                    """
+                    SELECT d.*
+                    FROM documents d
+                    WHERE d.chat_id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM marks m
+                          LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                          WHERE m.document_id = d.id
+                            AND m.status = 'available'
+                            AND (
+                                (? = 1 AND (
+                                    m.normalized_article = ?
+                                    OR m.normalized_article LIKE ? ESCAPE '!'
+                                    OR m.normalized_article = ?
+                                    OR m.normalized_article LIKE ? ESCAPE '!'
+                                ))
+                                OR (? = 0 AND (
+                                    m.normalized_code = ?
+                                    OR m.normalized_code LIKE ? ESCAPE '!'
+                                    OR m.normalized_article LIKE ? ESCAPE '!'
+                                    OR i.normalized_display_name LIKE ? ESCAPE '!'
+                                    OR i.normalized_short_code LIKE ? ESCAPE '!'
+                                    OR (? = 1 AND d.search_name LIKE ? ESCAPE '!')
+                                ))
+                          )
+                      )
+                    ORDER BY d.id DESC
+                    LIMIT 1
+                    """,
+                    (chat_id, *match_values),
+                ).fetchone()
+            else:
+                document_row = connection.execute(
+                    """
+                    SELECT d.*
+                    FROM documents d
+                    WHERE d.chat_id = ? AND d.id = ?
+                      AND EXISTS (
+                          SELECT 1 FROM marks m
+                          LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                          WHERE m.document_id = d.id
+                            AND m.status = 'available'
+                            AND (
+                                (? = 1 AND (
+                                    m.normalized_article = ?
+                                    OR m.normalized_article LIKE ? ESCAPE '!'
+                                    OR m.normalized_article = ?
+                                    OR m.normalized_article LIKE ? ESCAPE '!'
+                                ))
+                                OR (? = 0 AND (
+                                    m.normalized_code = ?
+                                    OR m.normalized_code LIKE ? ESCAPE '!'
+                                    OR m.normalized_article LIKE ? ESCAPE '!'
+                                    OR i.normalized_display_name LIKE ? ESCAPE '!'
+                                    OR i.normalized_short_code LIKE ? ESCAPE '!'
+                                    OR (? = 1 AND d.search_name LIKE ? ESCAPE '!')
+                                ))
+                          )
+                      )
+                    """,
+                    (chat_id, document_id, *match_values),
+                ).fetchone()
 
             if document_row is None:
                 stats = self.stats(chat_id)
@@ -1548,6 +1597,226 @@ class MarksInventory:
             ).fetchall()
         return [str(row["display_name"]) for row in rows]
 
+    def reset_inventory(self, chat_id: int) -> int:
+        """Возвращает все выбранные марки чата в available. Возвращает число сброшенных."""
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                """
+                UPDATE marks
+                SET status = 'available', selected_at = NULL, claim_token = ''
+                WHERE status = 'selected'
+                  AND document_id IN (
+                      SELECT id FROM documents WHERE chat_id = ?
+                  )
+                """,
+                (chat_id,),
+            )
+        return max(0, int(cursor.rowcount))
+
+    def find_available_by_article(
+        self,
+        chat_id: int,
+        article: str,
+    ) -> list[AvailableMarkInfo]:
+        """Находит все свободные марки по артикулу (точное совпадение)."""
+        normalized = normalize_code(article)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.id, m.article, m.page_index, m.position_on_page,
+                       i.display_name, m.document_id
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                WHERE d.chat_id = ?
+                  AND m.status = 'available'
+                  AND (
+                      m.normalized_article = ?
+                      OR i.normalized_display_name LIKE ? ESCAPE '!'
+                  )
+                ORDER BY m.page_index, m.position_on_page
+                """,
+                (
+                    chat_id,
+                    normalized,
+                    f"%{escape_like(normalized)}%",
+                ),
+            ).fetchall()
+        return [
+            AvailableMarkInfo(
+                id=int(row["id"]),
+                article=str(row["article"] or ""),
+                page_number=int(row["page_index"]) + 1,
+                position_on_page=int(row["position_on_page"]),
+                display_name=str(row["display_name"] or ""),
+                document_id=int(row["document_id"]),
+            )
+            for row in rows
+        ]
+
+    def claim_specific_marks(
+        self,
+        chat_id: int,
+        mark_ids: list[int],
+    ) -> ClaimResult:
+        """Выбирает конкретные марки по ID."""
+        if not mark_ids:
+            stats = self.stats(chat_id)
+            return ClaimResult(
+                document_id=None,
+                matched=0,
+                total=stats.total,
+                available=stats.available,
+                pdf_bytes=b"",
+                output_name=None,
+            )
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            placeholders = ",".join("?" for _ in mark_ids)
+            rows = connection.execute(
+                f"""
+                SELECT m.*, d.file_name, d.pdf_path
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                WHERE d.chat_id = ?
+                  AND m.id IN ({placeholders})
+                  AND m.status = 'available'
+                """,
+                (chat_id, *mark_ids),
+            ).fetchall()
+            if not rows:
+                connection.rollback()
+                stats = self.stats(chat_id)
+                return ClaimResult(
+                    document_id=None,
+                    matched=0,
+                    total=stats.total,
+                    available=stats.available,
+                    pdf_bytes=b"",
+                    output_name=None,
+                )
+
+            document_id = int(rows[0]["document_id"])
+            source = Path(str(rows[0]["pdf_path"])).read_bytes()
+            document = pymupdf.open(stream=source, filetype="pdf")
+            try:
+                for row in rows:
+                    rectangle = pymupdf.Rect(row["x0"], row["y0"], row["x1"], row["y1"])
+                    document[int(row["page_index"])].draw_rect(
+                        rectangle,
+                        color=(0.0, 0.65, 0.0),
+                        fill=(0.35, 1.0, 0.35),
+                        width=2.5,
+                        fill_opacity=self.highlight_opacity,
+                        stroke_opacity=0.95,
+                        overlay=True,
+                    )
+                output_pdf = document.tobytes(deflate=True, garbage=3)
+            finally:
+                document.close()
+
+            claim_token = secrets.token_urlsafe(24)
+            connection.executemany(
+                """
+                UPDATE marks
+                SET status = 'selected', selected_at = CURRENT_TIMESTAMP, claim_token = ?
+                WHERE id = ? AND status = 'available'
+                """,
+                [(claim_token, int(row["id"])) for row in rows],
+            )
+            counts = connection.execute(
+                """
+                SELECT COUNT(m.id) AS total,
+                       SUM(m.status = 'available') AS available
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                WHERE d.chat_id = ?
+                """,
+                (chat_id,),
+            ).fetchone()
+            connection.commit()
+
+        source_name = Path(str(rows[0]["file_name"])).stem
+        return ClaimResult(
+            document_id=document_id,
+            matched=len(rows),
+            total=int(counts["total"] or 0),
+            available=int(counts["available"] or 0),
+            pdf_bytes=output_pdf,
+            output_name=f"{source_name}_marked.pdf",
+            locations=tuple(
+                ClaimLocation(
+                    article=str(row["article"]),
+                    page_number=int(row["page_index"]) + 1,
+                    position_on_page=int(row["position_on_page"]),
+                )
+                for row in rows
+            ),
+            claim_token=claim_token,
+        )
+
+    def selected_marks_by_query(
+        self,
+        chat_id: int,
+        query: str,
+    ) -> list[SelectedMarkInfo]:
+        """Находит уже выбранные марки чата по коду, названию или артикулу."""
+        normalized_query = normalize_code(query)
+        name_query = query.strip().casefold()
+        if not name_query or not normalized_query:
+            return []
+        code_pattern = f"%{escape_like(normalized_query)}%"
+        name_pattern = f"%{escape_like(name_query)}%"
+        article_prefix = f"{escape_like(normalized_query)}-%"
+        branded_query = f"covani{normalized_query}"
+        branded_prefix = f"{escape_like(branded_query)}-%"
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.article, m.page_index, m.position_on_page, m.selected_at
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                WHERE d.chat_id = ?
+                  AND m.status = 'selected'
+                  AND (
+                      m.normalized_code = ?
+                      OR m.normalized_code LIKE ? ESCAPE '!'
+                      OR m.normalized_article = ?
+                      OR m.normalized_article LIKE ? ESCAPE '!'
+                      OR m.normalized_article = ?
+                      OR m.normalized_article LIKE ? ESCAPE '!'
+                      OR i.normalized_display_name LIKE ? ESCAPE '!'
+                      OR i.normalized_short_code LIKE ? ESCAPE '!'
+                      OR d.search_name LIKE ? ESCAPE '!'
+                  )
+                ORDER BY m.selected_at DESC
+                LIMIT 10
+                """,
+                (
+                    chat_id,
+                    normalized_query,
+                    code_pattern,
+                    normalized_query,
+                    article_prefix,
+                    branded_query,
+                    branded_prefix,
+                    name_pattern,
+                    code_pattern,
+                    name_pattern,
+                ),
+            ).fetchall()
+        return [
+            SelectedMarkInfo(
+                article=str(row["article"] or ""),
+                page_number=int(row["page_index"]) + 1,
+                position_on_page=int(row["position_on_page"]),
+                selected_at=str(row["selected_at"] or ""),
+            )
+            for row in rows
+        ]
+
     def claim_current_by_article(
         self,
         chat_id: int,
@@ -1605,6 +1874,40 @@ class MarksInventory:
                 model_only or article,
                 stop_article_quantity=quantity,
                 document_id=document_id,
+            )
+
+        normalized = normalize_code(article)
+        with self._connection() as connection:
+            distinct = connection.execute(
+                """
+                SELECT COUNT(DISTINCT m.normalized_article) AS n
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                WHERE d.chat_id = ?
+                  AND (? IS NULL OR d.id = ?)
+                  AND m.status = 'available'
+                  AND (
+                      m.normalized_article = ?
+                      OR m.normalized_article LIKE ? ESCAPE '!'
+                  )
+                """,
+                (
+                    chat_id,
+                    document_id,
+                    document_id,
+                    normalized,
+                    f"{escape_like(normalized)}-%",
+                ),
+            ).fetchone()
+        if int(distinct["n"]) > 1:
+            stats = self.stats(chat_id)
+            return ClaimResult(
+                document_id=None,
+                matched=0,
+                total=stats.total,
+                available=stats.available,
+                pdf_bytes=b"",
+                output_name=None,
             )
 
         result = self.claim(
