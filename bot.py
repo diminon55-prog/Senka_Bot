@@ -180,7 +180,8 @@ def build_documents_keyboard(documents):
 CANCEL_WORDS = frozenset({"отмена", "отменить", "отбой", "стоп", "хватит"})
 pending_suggestions: dict[int, list[str]] = {}
 pending_mark_selection: dict[int, list[int]] = {}
-pending_command_input: dict[int, str] = {}  # chat_id -> "findmark" | "findarticle"
+pending_command_input: dict[int, str] = {}  # chat_id -> "findmark" | "findarticle" | "unmark"
+pending_unmark_selection: dict[int, list[int]] = {}  # chat_id -> [mark_id, ...]
 
 marks_store = MarksInventory(
     db_path=MARKS_DB_PATH,
@@ -657,6 +658,62 @@ def handle_usedoc(message):
         bot.reply_to(message, "Не удалось переключить документ — попробуй /documents заново.")
 
 
+def build_unmark_selection_keyboard(matches):
+    """Кнопки возврата марок в available (по одной на марку)."""
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    for idx, m in enumerate(matches, 1):
+        label = f"↩️ {idx}. лист {m.page_number}, №{m.position_on_page}"
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(
+                label, callback_data=f"unm:1:{m.id}"
+            )
+        )
+    keyboard.row(
+        telebot.types.InlineKeyboardButton("↩️ Все", callback_data="unm:all:0"),
+        telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="unm:cancel:0"),
+    )
+    return keyboard
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("unm:"))
+def handle_unmark_selection_callback(call):
+    chat_id = call.message.chat.id
+    set_active_chat_id(chat_id)
+    try:
+        _, mode, raw_id = call.data.split(":", 2)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Некорректная кнопка.")
+        return
+    pending_ids = pending_unmark_selection.get(chat_id)
+    if not pending_ids:
+        bot.answer_callback_query(call.id, "Выбор уже не актуален — повтори /unmark.")
+        return
+    if mode == "cancel":
+        pending_unmark_selection.pop(chat_id, None)
+        bot.answer_callback_query(call.id, "Отменено.")
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        return
+    if mode == "all":
+        selected_ids = pending_ids
+    else:
+        mark_id = int(raw_id)
+        if mark_id not in pending_ids:
+            bot.answer_callback_query(call.id, "Эта марка уже не в списке.")
+            return
+        selected_ids = [mark_id]
+    pending_unmark_selection.pop(chat_id, None)
+    released = marks_store.unselect_specific_marks(chat_id, selected_ids)
+    bot.answer_callback_query(call.id)
+    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    stats = marks_store.stats(chat_id)
+    bot.send_message(
+        chat_id,
+        f"✅ <b>Вернул в базу: {released} марк(и).</b> "
+        f"Свободно теперь: <b>{stats.available}</b>.",
+        parse_mode="HTML",
+    )
+
+
 @bot.callback_query_handler(func=lambda call: call.data.startswith("sel:"))
 def handle_mark_selection_callback(call):
     chat_id = call.message.chat.id
@@ -795,10 +852,17 @@ def handle_markstats(message):
 
 @bot.message_handler(commands=['unmark', 'вернуть'])
 def handle_unmark(message):
-    set_active_chat_id(message.chat.id)
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
     payload = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
     if not payload:
-        bot.reply_to(message, "Использование: /unmark [количество] <код, название или артикул>")
+        pending_command_input[chat_id] = "unmark"
+        bot.reply_to(
+            message,
+            "🔍 Что возвращаем? Введи <b>код, название или артикул</b> выбранной марки.\n"
+            "<i>«отмена» — выйти.</i>",
+            parse_mode="HTML",
+        )
         return
 
     quantity = 1
@@ -810,6 +874,38 @@ def handle_unmark(message):
     if not query:
         bot.reply_to(message, "После количества укажи код, название или артикул.")
         return
+
+    # Интерактивный выбор, если совпадений несколько и количество не задано
+    if quantity == 1:
+        matches = marks_store.find_selected_by_article(chat_id, query)
+        if len(matches) > 1:
+            pending_unmark_selection[chat_id] = [m.id for m in matches]
+            document_names = {
+                doc["id"]: doc["product_name"] or doc["file_name"]
+                for doc in marks_store.list_documents(chat_id)
+            }
+            lines = []
+            for idx, m in enumerate(matches, 1):
+                name = html.escape(m.display_name or m.article or "—")
+                doc_name = html.escape(document_names.get(m.document_id, ""))
+                doc_suffix = f", 📄 {doc_name}" if doc_name else ""
+                lines.append(
+                    f"<b>{idx}.</b> {name}\n"
+                    f"    └ <i>лист {m.page_number}, №{m.position_on_page}{doc_suffix}</i>"
+                )
+            text = (
+                f"↩️ По запросу <code>{html.escape(query)}</code> "
+                f"найдено <b>{len(matches)}</b> выбранных марок:\n\n"
+                + "\n".join(lines)
+                + "\n\n<i>Нажми кнопку ниже, введи номера через запятую, или «все».</i>"
+            )
+            bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=build_unmark_selection_keyboard(matches),
+            )
+            return
 
     released = marks_store.unselect_marks(message.chat.id, query, quantity)
     if released:
@@ -1068,6 +1164,8 @@ def handle_text(message):
     if (message.text or "").strip().lower() in CANCEL_WORDS:
         if pending_command_input.pop(chat_id, None) is not None:
             bot.reply_to(message, "Отменил поиск. Что делаем дальше?")
+        elif pending_unmark_selection.pop(chat_id, None) is not None:
+            bot.reply_to(message, "Отменил возврат марок. Что ищем дальше?")
         elif pending_suggestions.pop(chat_id, None) is not None:
             bot.reply_to(message, "Отменил. Что ищем дальше?")
         elif pending_mark_selection.pop(chat_id, None) is not None:
@@ -1075,7 +1173,7 @@ def handle_text(message):
         else:
             bot.reply_to(message, "Нечего отменять — поиска в ожидании нет.")
         return
-    # Продолжение диалога, начатого командой /findmark или /findarticle без аргумента
+    # Продолжение диалога, начатого командой /findmark, /findarticle или /unmark без аргумента
     pending_command = pending_command_input.pop(chat_id, None)
     if pending_command is not None:
         query = (message.text or "").strip()
@@ -1084,12 +1182,48 @@ def handle_text(message):
             return
         if pending_command == "findarticle":
             response = tool_find_article(query, 1)
+        elif pending_command == "unmark":
+            released = marks_store.unselect_marks(chat_id, query, 1)
+            if released:
+                stats = marks_store.stats(chat_id)
+                response = f"✅ Вернул в базу: {released} марк(и). Свободно теперь: {stats.available}."
+            else:
+                response = "Не нашёл выбранных марок по этому запросу. Проверь код, название или артикул."
         else:
             response = tool_find_marks(query, 1)
         if response and not response.startswith("✅"):
             reply_text(message, response)
+        elif response and response.startswith("✅"):
+            reply_text(message, response)
         return
-    # Проверяем, не выбирает ли пользователь номера марок из списка
+    # Проверяем, не выбирает ли пользователь номера марок для возврата
+    if chat_id in pending_unmark_selection:
+        text_lower = message.text.strip().lower()
+        if text_lower in ("все", "всё", "all"):
+            selected_ids = pending_unmark_selection.pop(chat_id)
+            released = marks_store.unselect_specific_marks(chat_id, selected_ids)
+            stats = marks_store.stats(chat_id)
+            bot.reply_to(
+                message,
+                f"✅ Вернул в базу: {released} марк(и). Свободно теперь: {stats.available}.",
+            )
+            return
+        numbers = []
+        for part in text_lower.replace(",", " ").split():
+            if part.isdigit():
+                idx = int(part)
+                if 1 <= idx <= len(pending_unmark_selection[chat_id]):
+                    numbers.append(idx)
+        if numbers:
+            selected_ids = [pending_unmark_selection[chat_id][i-1] for i in numbers]
+            pending_unmark_selection.pop(chat_id)
+            released = marks_store.unselect_specific_marks(chat_id, selected_ids)
+            stats = marks_store.stats(chat_id)
+            bot.reply_to(
+                message,
+                f"✅ Вернул в базу: {released} марк(и). Свободно теперь: {stats.available}.",
+            )
+            return
     if chat_id in pending_mark_selection:
         text_lower = message.text.strip().lower()
         if text_lower in ("все", "всё", "all"):

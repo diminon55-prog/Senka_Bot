@@ -1459,6 +1459,70 @@ class MarksInventory:
             )
         return max(0, int(cursor.rowcount))
 
+    def find_selected_by_article(
+        self,
+        chat_id: int,
+        article: str,
+    ) -> list[AvailableMarkInfo]:
+        """Находит выбранные марки по артикулу/названию (для интерактивной отмены)."""
+        normalized = normalize_code(article)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.id, m.article, m.page_index, m.position_on_page,
+                       i.display_name, m.document_id
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                WHERE d.chat_id = ?
+                  AND m.status = 'selected'
+                  AND (
+                      m.normalized_article = ?
+                      OR m.normalized_article LIKE ? ESCAPE '!'
+                      OR i.normalized_display_name LIKE ? ESCAPE '!'
+                  )
+                ORDER BY m.selected_at DESC, m.page_index, m.position_on_page
+                """,
+                (
+                    chat_id,
+                    normalized,
+                    f"{escape_like(normalized)}-%",
+                    f"%{escape_like(normalize_code(article))}%",
+                ),
+            ).fetchall()
+        return [
+            AvailableMarkInfo(
+                id=int(row["id"]),
+                article=str(row["article"] or ""),
+                page_number=int(row["page_index"]) + 1,
+                position_on_page=int(row["position_on_page"]),
+                display_name=str(row["display_name"] or ""),
+                document_id=int(row["document_id"]),
+            )
+            for row in rows
+        ]
+
+    def unselect_specific_marks(self, chat_id: int, mark_ids: list[int]) -> int:
+        """Возвращает конкретные марки по ID в available. Атомарно."""
+        if not mark_ids:
+            return 0
+        placeholders = ",".join("?" for _ in mark_ids)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                f"""
+                UPDATE marks
+                SET status = 'available', selected_at = NULL, claim_token = ''
+                WHERE id IN ({placeholders})
+                  AND status = 'selected'
+                  AND document_id IN (SELECT id FROM documents WHERE chat_id = ?)
+                """,
+                (*mark_ids, chat_id),
+            )
+            released = cursor.rowcount
+            connection.commit()
+        return max(0, released)
+
     def unselect_marks(
         self,
         chat_id: int,

@@ -807,6 +807,63 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertNotIn(77, bot_module.pending_command_input)
         self.assertIn("отменил", reply_bot.replies[-1][0].lower())
 
+    def test_unmark_without_argument_asks_and_waits(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.pending_command_input.clear()
+
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/unmark")
+        bot_module.handle_unmark(message)
+
+        self.assertEqual(bot_module.pending_command_input.get(77), "unmark")
+        self.assertIn("возвращаем", reply_bot.replies[0][0].lower())
+        self.assertEqual(reply_bot.replies[0][1].get("parse_mode"), "HTML")
+
+    def test_unmark_with_multiple_matches_shows_keyboard(self):
+        bot_module = load_bot_module()
+
+        class FakeUiBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        ui_bot = FakeUiBot()
+        bot_module.bot = ui_bot
+        bot_module.pending_unmark_selection.clear()
+        bot_module.marks_store = SimpleNamespace(
+            find_selected_by_article=lambda chat_id, query: [
+                SimpleNamespace(id=101, article="181-7А", page_number=2,
+                                position_on_page=5, display_name="Босоножки ЭВАЛИ 181-7А р.37",
+                                document_id=3),
+                SimpleNamespace(id=102, article="181-7А", page_number=2,
+                                position_on_page=38, display_name="Босоножки ЭВАЛИ 181-7А р.39",
+                                document_id=3),
+            ],
+            list_documents=lambda chat_id: [
+                {"id": 3, "file_name": "OBEDINENO.pdf", "product_name": "OBEDINENO",
+                 "created_at": "", "total": 1, "available": 1, "selected": 0,
+                 "is_current": True},
+            ],
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/unmark 181-7А")
+
+        bot_module.handle_unmark(message)
+
+        self.assertEqual(bot_module.pending_unmark_selection.get(77), [101, 102])
+        text, kwargs = ui_bot.replies[0]
+        self.assertIn("найдено", text.lower())
+        self.assertIn("181-7А", text)
+        keyboard = kwargs.get("reply_markup")
+        self.assertIsNotNone(keyboard)
+        callbacks = [b.callback_data for row in keyboard.keyboard for b in row]
+        self.assertIn("unm:1:101", callbacks)
+        self.assertIn("unm:all:0", callbacks)
+        self.assertIn("unm:cancel:0", callbacks)
+
     def test_plain_article_classifier_requires_letters_and_digits(self):
         bot_module = load_bot_module()
 
@@ -1042,6 +1099,7 @@ class BotMarksIntegrationTests(unittest.TestCase):
                 calls.append((chat_id, query, quantity)) or 1
             ),
             stats=lambda chat_id: SimpleNamespace(available=10),
+            find_selected_by_article=lambda chat_id, query: [],
         )
         message = SimpleNamespace(
             chat=SimpleNamespace(id=77),
@@ -1079,7 +1137,8 @@ class BotMarksIntegrationTests(unittest.TestCase):
         reply_bot = FakePhotoBot(b"")
         bot_module.bot = reply_bot
         bot_module.marks_store = SimpleNamespace(
-            unselect_marks=lambda chat_id, query, quantity=1: 0
+            unselect_marks=lambda chat_id, query, quantity=1: 0,
+            find_selected_by_article=lambda chat_id, query: [],
         )
         message = SimpleNamespace(
             chat=SimpleNamespace(id=77),
