@@ -17,6 +17,9 @@ class DummyBot:
     def message_handler(self, *args, **kwargs):
         return lambda handler: handler
 
+    def callback_query_handler(self, *args, **kwargs):
+        return lambda handler: handler
+
     def infinity_polling(self, *args, **kwargs):
         pass
 

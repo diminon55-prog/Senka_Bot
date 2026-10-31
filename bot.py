@@ -81,7 +81,9 @@ HELP_TEXT = (
     "в базу.\n"
     "9. /export — выгрузить все выбранные марки в CSV для ревизии.\n"
     "10. /resetmarks — сбросить все выбранные марки обратно в свободные.\n"
-    "11. /list — показать список выбранных марок таблицей.\n\n"
+    "11. /list — показать список выбранных марок таблицей.\n"
+    "12. /documents — загруженные PDF: счётчики марок и кнопки переключения "
+    "текущего документа (для /findarticle).\n\n"
     "Другие команды:\n"
     "/stats — статистика запросов Gemini.\n"
     "/reset — сбросить только диалоговый контекст; база марок сохранится.\n"
@@ -143,9 +145,42 @@ def reply_text(message, text):
     return bot.reply_to(message, text)
 
 
+def build_mark_selection_keyboard(chat_id, matches):
+    """Кнопки выбора марки из списка дубликатов (по одной на марку)."""
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    for idx, m in enumerate(matches, 1):
+        label = f"{idx}. лист {m.page_number}, №{m.position_on_page}"
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(
+                label, callback_data=f"sel:1:{m.id}"
+            )
+        )
+    keyboard.row(
+        telebot.types.InlineKeyboardButton("📦 Все", callback_data="sel:all:0"),
+        telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="sel:cancel:0"),
+    )
+    return keyboard
+
+
+def build_documents_keyboard(documents):
+    """Кнопки переключения текущего документа."""
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    for position, doc in enumerate(documents, 1):
+        marker = "✅ " if doc["is_current"] else ""
+        name = doc["product_name"] or doc["file_name"]
+        label = f"{marker}{position}. {name[:40]}"
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(
+                label, callback_data=f"doc:{doc['id']}"
+            )
+        )
+    return keyboard
+
+
 CANCEL_WORDS = frozenset({"отмена", "отменить", "отбой", "стоп", "хватит"})
 pending_suggestions: dict[int, list[str]] = {}
 pending_mark_selection: dict[int, list[int]] = {}
+pending_command_input: dict[int, str] = {}  # chat_id -> "findmark" | "findarticle"
 
 marks_store = MarksInventory(
     db_path=MARKS_DB_PATH,
@@ -363,8 +398,10 @@ def claim_location_details(result) -> str:
             where = f"л.{loc.page_number}"
         article = html.escape(getattr(loc, "article", "") or "—")
         name = html.escape(getattr(loc, "display_name", "") or "—")
+        document_name = html.escape(getattr(loc, "document_name", "") or "")
+        suffix = f" │ 📄 {document_name}" if document_name else ""
         rows.append(
-            f"<code>{article}</code> │ {name} │ <u>{where}</u>"
+            f"<code>{article}</code> │ {name} │ <u>{where}</u>{suffix}"
         )
     if not rows:
         return ""
@@ -404,19 +441,32 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
         matches = marks_store.find_available_by_article(chat_id, article)
         if len(matches) > 1:
             pending_mark_selection[chat_id] = [m.id for m in matches]
+            document_names = {
+                doc["id"]: doc["product_name"] or doc["file_name"]
+                for doc in marks_store.list_documents(chat_id)
+            }
             lines = []
             for idx, m in enumerate(matches, 1):
                 name = html.escape(m.display_name or m.article or "—")
+                doc_name = html.escape(document_names.get(m.document_id, ""))
+                doc_suffix = f", 📄 {doc_name}" if doc_name else ""
                 lines.append(
                     f"<b>{idx}.</b> {name}\n"
-                    f"    └ <i>лист {m.page_number}, №{m.position_on_page}</i>"
+                    f"    └ <i>лист {m.page_number}, №{m.position_on_page}{doc_suffix}</i>"
                 )
-            return (
+            text = (
                 f"🔎 По артикулу <code>{html.escape(article)}</code> "
                 f"найдено <b>{len(matches)}</b> марок:\n\n"
                 + "\n".join(lines)
-                + "\n\n<i>Введи номер (1, 2...), несколько через запятую, или «все».</i>"
+                + "\n\n<i>Нажми кнопку ниже, введи номера через запятую, или «все».</i>"
             )
+            bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=build_mark_selection_keyboard(chat_id, matches),
+            )
+            return ""
 
     try:
         result = marks_store.claim_current_by_article(chat_id, article, quantity)
@@ -446,13 +496,15 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
 
     if result.matched == 1:
         location = result.locations[0]
-        source_name = Path(str(result.output_name)).stem.replace("_marked", "")
+        source_name = getattr(location, "document_name", "") or Path(
+            str(result.output_name)
+        ).stem.replace("_marked", "")
         caption = (
             f"✅ <b>Марка найдена и отмечена!</b>\n"
             f"<blockquote>"
             f"<b>Артикул:</b> <code>{html.escape(location.article or article)}</code>\n"
+            f"<b>Документ:</b> {html.escape(source_name)}\n"
             f"<b>Лист:</b> {location.page_number}  <b>№ на листе:</b> {location.position_on_page}\n"
-            f"<b>Источник:</b> {html.escape(source_name)}\n"
             f"</blockquote>"
             f"Свободно: <b>{result.available}</b>."
         )
@@ -548,12 +600,145 @@ def handle_spusk(message):
         return
     tool_spusk_a3()
 
+@bot.message_handler(commands=['documents', 'документы'])
+def handle_documents(message):
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
+    documents = marks_store.list_documents(chat_id)
+    if not documents:
+        bot.reply_to(message, "Загруженных PDF с марками пока нет. Пришли файл.")
+        return
+    lines = []
+    for position, doc in enumerate(documents, 1):
+        marker = " ◀ <b>текущий</b>" if doc["is_current"] else ""
+        name = html.escape(doc["product_name"] or doc["file_name"])
+        lines.append(
+            f"<b>{position}.</b> {name}{marker}\n"
+            f"    └ <i>всего {doc['total']}, свободно {doc['available']}, "
+            f"выбрано {doc['selected']}</i>"
+        )
+    text = (
+        "📂 <b>Загруженные документы:</b>\n\n"
+        + "\n".join(lines)
+        + "\n\n<i>Нажми кнопку, чтобы сделать документ текущим для /findarticle.</i>"
+    )
+    bot.send_message(
+        chat_id,
+        text,
+        parse_mode="HTML",
+        reply_markup=build_documents_keyboard(documents),
+    )
+
+
+@bot.message_handler(commands=['usedoc'])
+def handle_usedoc(message):
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
+    documents = marks_store.list_documents(chat_id)
+    if not documents:
+        bot.reply_to(message, "Загруженных PDF с марками пока нет.")
+        return
+    payload = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
+    if not payload.isdigit() or not (1 <= int(payload) <= len(documents)):
+        bot.reply_to(
+            message,
+            f"Использование: /usedoc <номер от 1 до {len(documents)}> — номера смотри в /documents.",
+        )
+        return
+    doc = documents[int(payload) - 1]
+    if marks_store.set_current_document(chat_id, doc["id"]):
+        name = html.escape(doc["product_name"] or doc["file_name"])
+        bot.reply_to(
+            message,
+            f"✅ Текущий документ: <b>{name}</b> (свободно {doc['available']}).",
+            parse_mode="HTML",
+        )
+    else:
+        bot.reply_to(message, "Не удалось переключить документ — попробуй /documents заново.")
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("sel:"))
+def handle_mark_selection_callback(call):
+    chat_id = call.message.chat.id
+    set_active_chat_id(chat_id)
+    try:
+        _, mode, raw_id = call.data.split(":", 2)
+    except ValueError:
+        bot.answer_callback_query(call.id, "Некорректная кнопка.")
+        return
+    pending_ids = pending_mark_selection.get(chat_id)
+    if not pending_ids:
+        bot.answer_callback_query(call.id, "Выбор уже не актуален — повтори поиск.")
+        return
+    if mode == "cancel":
+        pending_mark_selection.pop(chat_id, None)
+        bot.answer_callback_query(call.id, "Отменено.")
+        bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+        return
+    if mode == "all":
+        selected_ids = pending_ids
+    else:
+        mark_id = int(raw_id)
+        if mark_id not in pending_ids:
+            bot.answer_callback_query(call.id, "Эта марка уже не в списке.")
+            return
+        selected_ids = [mark_id]
+    pending_mark_selection.pop(chat_id, None)
+    result = marks_store.claim_specific_marks(chat_id, selected_ids)
+    bot.answer_callback_query(call.id)
+    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    if result.matched:
+        source_name = Path(str(result.output_name)).stem.replace("_marked", "")
+        caption = (
+            f"✅ <b>Отмечено марок: {result.matched}.</b>\n"
+            f"Источник: {html.escape(source_name)}. "
+            f"Свободно: <b>{result.available}</b>."
+        )
+        details = claim_location_details(result)
+        if details:
+            caption = f"{caption}\n{details}"
+        send_claimed_document(chat_id, result, caption)
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("doc:"))
+def handle_document_callback(call):
+    chat_id = call.message.chat.id
+    set_active_chat_id(chat_id)
+    try:
+        document_id = int(call.data.split(":", 1)[1])
+    except ValueError:
+        bot.answer_callback_query(call.id, "Некорректная кнопка.")
+        return
+    if not marks_store.set_current_document(chat_id, document_id):
+        bot.answer_callback_query(call.id, "Документ не найден.")
+        return
+    documents = marks_store.list_documents(chat_id)
+    doc = next((d for d in documents if d["id"] == document_id), None)
+    name = html.escape((doc["product_name"] or doc["file_name"]) if doc else f"#{document_id}")
+    bot.answer_callback_query(call.id, "Текущий документ переключён.")
+    bot.edit_message_reply_markup(
+        chat_id, call.message.message_id, reply_markup=build_documents_keyboard(documents)
+    )
+    bot.send_message(
+        chat_id,
+        f"✅ Текущий документ: <b>{name}</b>.",
+        parse_mode="HTML",
+    )
+
+
 @bot.message_handler(commands=['findmark', 'марка'])
 def handle_findmark(message):
-    set_active_chat_id(message.chat.id)
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
     payload = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
     if not payload:
-        bot.reply_to(message, "Использование: /findmark [количество] <Data Matrix или название>")
+        pending_command_input[chat_id] = "findmark"
+        bot.reply_to(
+            message,
+            "🔍 Что ищем? Введи <b>название товара</b> или <b>Data Matrix</b>.\n"
+            "<i>«отмена» — выйти из поиска.</i>",
+            parse_mode="HTML",
+        )
         return
 
     quantity = 1
@@ -573,10 +758,18 @@ def handle_findmark(message):
 
 @bot.message_handler(commands=['findarticle', 'артикул'])
 def handle_findarticle(message):
-    set_active_chat_id(message.chat.id)
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
     payload = message.text.split(maxsplit=1)[1].strip() if len(message.text.split(maxsplit=1)) > 1 else ""
     if not payload:
-        bot.reply_to(message, "Использование: /findarticle [количество] <артикул>")
+        pending_command_input[chat_id] = "findarticle"
+        bot.reply_to(
+            message,
+            "🔍 Какой <b>артикул</b> ищем? Например: <code>COVANI SMS25-BHLM3</code> "
+            "или <code>181-7А</code>.\n"
+            "<i>«отмена» — выйти из поиска.</i>",
+            parse_mode="HTML",
+        )
         return
 
     quantity = 1
@@ -873,12 +1066,28 @@ def handle_text(message):
     chat_id = message.chat.id
     set_active_chat_id(chat_id)
     if (message.text or "").strip().lower() in CANCEL_WORDS:
-        if pending_suggestions.pop(chat_id, None) is not None:
+        if pending_command_input.pop(chat_id, None) is not None:
+            bot.reply_to(message, "Отменил поиск. Что делаем дальше?")
+        elif pending_suggestions.pop(chat_id, None) is not None:
             bot.reply_to(message, "Отменил. Что ищем дальше?")
         elif pending_mark_selection.pop(chat_id, None) is not None:
             bot.reply_to(message, "Отменил выбор марок. Что ищем дальше?")
         else:
             bot.reply_to(message, "Нечего отменять — поиска в ожидании нет.")
+        return
+    # Продолжение диалога, начатого командой /findmark или /findarticle без аргумента
+    pending_command = pending_command_input.pop(chat_id, None)
+    if pending_command is not None:
+        query = (message.text or "").strip()
+        if not query:
+            bot.reply_to(message, "Пустой запрос — введи название или артикул.")
+            return
+        if pending_command == "findarticle":
+            response = tool_find_article(query, 1)
+        else:
+            response = tool_find_marks(query, 1)
+        if response and not response.startswith("✅"):
+            reply_text(message, response)
         return
     # Проверяем, не выбирает ли пользователь номера марок из списка
     if chat_id in pending_mark_selection:
@@ -1027,6 +1236,7 @@ def configure_bot_commands():
             telebot.types.BotCommand("export", "Выгрузить выбранные марки в CSV"),
             telebot.types.BotCommand("resetmarks", "Сбросить все выбранные марки"),
             telebot.types.BotCommand("list", "Показать список выбранных марок"),
+            telebot.types.BotCommand("documents", "Загруженные PDF и переключение текущего"),
             telebot.types.BotCommand("draw", "Нарисовать изображение"),
             telebot.types.BotCommand("spusk", "A3-раскладка последнего PDF"),
             telebot.types.BotCommand("stats", "Статистика запросов Gemini"),

@@ -631,6 +631,182 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertEqual(bot_module.active_chat_id, 77)
         self.assertEqual(command_bot.replies, [])
 
+    def test_documents_command_lists_documents_with_keyboard(self):
+        bot_module = load_bot_module()
+
+        class FakeUiBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+                self.messages = []
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        ui_bot = FakeUiBot()
+        bot_module.bot = ui_bot
+        bot_module.marks_store = SimpleNamespace(
+            list_documents=lambda chat_id: [
+                {
+                    "id": 5,
+                    "file_name": "new.pdf",
+                    "product_name": "Босоножки ЭВАЛИ",
+                    "created_at": "2026-10-31 10:00:00",
+                    "total": 721,
+                    "available": 600,
+                    "selected": 121,
+                    "is_current": True,
+                },
+                {
+                    "id": 3,
+                    "file_name": "old.pdf",
+                    "product_name": "Сабо COVANI",
+                    "created_at": "2026-10-20 10:00:00",
+                    "total": 244,
+                    "available": 200,
+                    "selected": 44,
+                    "is_current": False,
+                },
+            ]
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/documents")
+
+        bot_module.handle_documents(message)
+
+        self.assertEqual(len(ui_bot.messages), 0)  # send_message записывает в replies
+        self.assertEqual(len(ui_bot.replies), 1)
+        text, kwargs = ui_bot.replies[0]
+        self.assertIn("Босоножки ЭВАЛИ", text)
+        self.assertIn("текущий", text)
+        self.assertIn("Сабо COVANI", text)
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        keyboard = kwargs.get("reply_markup")
+        self.assertIsNotNone(keyboard)
+        callbacks = [
+            button.callback_data
+            for row in keyboard.keyboard
+            for button in row
+        ]
+        self.assertEqual(callbacks, ["doc:5", "doc:3"])
+
+    def test_usedoc_command_switches_current_document(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        switched = []
+        bot_module.marks_store = SimpleNamespace(
+            list_documents=lambda chat_id: [
+                {"id": 5, "file_name": "new.pdf", "product_name": "ЭВАЛИ",
+                 "created_at": "", "total": 1, "available": 1, "selected": 0,
+                 "is_current": False},
+            ],
+            set_current_document=lambda chat_id, doc_id: switched.append(doc_id) or True,
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/usedoc 1")
+
+        bot_module.handle_usedoc(message)
+
+        self.assertEqual(switched, [5])
+        self.assertIn("Текущий документ", reply_bot.replies[0][0])
+
+    def test_mark_selection_callback_claims_specific_mark(self):
+        bot_module = load_bot_module()
+
+        class FakeCallbackBot(FakeSendingBot):
+            def __init__(self):
+                super().__init__()
+                self.answered = []
+                self.edited = []
+
+            def answer_callback_query(self, call_id, text=None):
+                self.answered.append((call_id, text))
+
+            def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+                self.edited.append((chat_id, message_id))
+
+        callback_bot = FakeCallbackBot()
+        bot_module.bot = callback_bot
+        bot_module.active_chat_id = None
+        bot_module.pending_mark_selection.clear()
+        bot_module.pending_mark_selection[77] = [101, 102]
+        claimed = []
+        bot_module.marks_store = SimpleNamespace(
+            grid_columns=8,
+            claim_specific_marks=lambda chat_id, ids: (
+                claimed.append(ids)
+                or SimpleNamespace(
+                    matched=1,
+                    available=9,
+                    pdf_bytes=b"%PDF-marked",
+                    output_name="ready_marks_marked.pdf",
+                    locations=(
+                        SimpleNamespace(
+                            article="181-7А",
+                            page_number=2,
+                            position_on_page=5,
+                            display_name="Босоножки ЭВАЛИ 181-7А",
+                        ),
+                    ),
+                )
+            ),
+        )
+        call = SimpleNamespace(
+            id="cb1",
+            data="sel:1:102",
+            message=SimpleNamespace(chat=SimpleNamespace(id=77), message_id=55),
+        )
+
+        bot_module.handle_mark_selection_callback(call)
+
+        self.assertEqual(claimed, [[102]])
+        self.assertNotIn(77, bot_module.pending_mark_selection)
+        self.assertEqual(callback_bot.answered, [("cb1", None)])
+        self.assertEqual(callback_bot.edited, [(77, 55)])
+        self.assertEqual(len(callback_bot.documents), 1)
+        self.assertIn("Отмечено марок: 1", callback_bot.documents[0][3])
+
+    def test_findarticle_without_argument_asks_for_article_and_waits(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.pending_command_input.clear()
+
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/findarticle")
+        bot_module.handle_findarticle(message)
+
+        self.assertEqual(bot_module.pending_command_input.get(77), "findarticle")
+        self.assertIn("артикул", reply_bot.replies[0][0].lower())
+        self.assertEqual(reply_bot.replies[0][1].get("parse_mode"), "HTML")
+
+        # Следующее текстовое сообщение идёт в поиск по артикулу
+        calls = []
+        bot_module.tool_find_article = lambda article, quantity=1: (
+            calls.append((article, quantity)) or "✅ Марка найдена"
+        )
+        followup = SimpleNamespace(chat=SimpleNamespace(id=77), text="181-7А")
+        bot_module.handle_text(followup)
+
+        self.assertEqual(calls, [("181-7А", 1)])
+        self.assertNotIn(77, bot_module.pending_command_input)
+
+    def test_findmark_without_argument_asks_for_query_and_cancel_works(self):
+        bot_module = load_bot_module()
+        reply_bot = FakePhotoBot(b"")
+        bot_module.bot = reply_bot
+        bot_module.pending_command_input.clear()
+
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/findmark")
+        bot_module.handle_findmark(message)
+
+        self.assertEqual(bot_module.pending_command_input.get(77), "findmark")
+        self.assertIn("название", reply_bot.replies[0][0].lower())
+
+        cancel = SimpleNamespace(chat=SimpleNamespace(id=77), text="отмена")
+        bot_module.handle_text(cancel)
+
+        self.assertNotIn(77, bot_module.pending_command_input)
+        self.assertIn("отменил", reply_bot.replies[-1][0].lower())
+
     def test_plain_article_classifier_requires_letters_and_digits(self):
         bot_module = load_bot_module()
 

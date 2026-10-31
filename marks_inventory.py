@@ -51,6 +51,7 @@ class ClaimLocation:
     page_number: int
     position_on_page: int
     display_name: str = ""
+    document_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -1403,6 +1404,7 @@ class MarksInventory:
             connection.commit()
 
         source_name = Path(str(document_row["file_name"])).stem
+        product_name = str(document_row["product_name"] or "")
         return ClaimResult(
             document_id=document_id,
             matched=len(rows),
@@ -1416,6 +1418,7 @@ class MarksInventory:
                     page_number=int(row["page_index"]) + 1,
                     position_on_page=int(row["position_on_page"]),
                     display_name=str(row["display_name"] or ""),
+                    document_name=product_name or source_name,
                 )
                 for row in rows
             ),
@@ -1682,7 +1685,7 @@ class MarksInventory:
             placeholders = ",".join("?" for _ in mark_ids)
             rows = connection.execute(
                 f"""
-                SELECT m.*, d.file_name, d.pdf_path, i.display_name
+                SELECT m.*, d.file_name, d.pdf_path, d.product_name, i.display_name
                 FROM marks m
                 JOIN documents d ON d.id = m.document_id
                 LEFT JOIN mark_text_index i ON i.mark_id = m.id
@@ -1758,6 +1761,9 @@ class MarksInventory:
                     page_number=int(row["page_index"]) + 1,
                     position_on_page=int(row["position_on_page"]),
                     display_name=str(row["display_name"] or ""),
+                    document_name=str(
+                        row["product_name"] if "product_name" in row.keys() else ""
+                    ) or source_name,
                 )
                 for row in rows
             ),
@@ -1938,6 +1944,52 @@ class MarksInventory:
                 document_id=document_id,
             )
         return result
+
+    def list_documents(self, chat_id: int) -> list[dict[str, Any]]:
+        """Документы чата со счётчиками марок и флагом текущего."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT d.id, d.file_name, d.product_name, d.created_at,
+                       COUNT(m.id) AS total,
+                       SUM(m.status = 'available') AS available,
+                       SUM(m.status = 'selected') AS selected,
+                       (s.current_document_id = d.id) AS is_current
+                FROM documents d
+                LEFT JOIN marks m ON m.document_id = d.id
+                LEFT JOIN chat_state s ON s.chat_id = d.chat_id
+                WHERE d.chat_id = ?
+                GROUP BY d.id
+                ORDER BY d.id DESC
+                """,
+                (chat_id,),
+            ).fetchall()
+        return [
+            {
+                "id": int(row["id"]),
+                "file_name": str(row["file_name"]),
+                "product_name": str(row["product_name"]),
+                "created_at": str(row["created_at"] or ""),
+                "total": int(row["total"] or 0),
+                "available": int(row["available"] or 0),
+                "selected": int(row["selected"] or 0),
+                "is_current": bool(row["is_current"]),
+            }
+            for row in rows
+        ]
+
+    def set_current_document(self, chat_id: int, document_id: int) -> bool:
+        """Делает документ текущим для чата. False, если документ чужой/нет."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT id FROM documents WHERE id = ? AND chat_id = ?",
+                (document_id, chat_id),
+            ).fetchone()
+            if row is None:
+                return False
+            self._set_current_document(connection, chat_id, document_id)
+            connection.commit()
+        return True
 
     def stats(self, chat_id: int) -> InventoryStats:
         with self._connection() as connection:
