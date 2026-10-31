@@ -69,6 +69,34 @@ def make_search_index_csv(
 
 
 class MarksInventoryTests(unittest.TestCase):
+    def test_extract_article_recognizes_numeric_cyrillic_article(self):
+        from marks_inventory import MarksInventory
+
+        self.assertEqual(
+            MarksInventory._extract_article(
+                'босоножки "ЭВАЛИ" 181-7А р.36 молочный'.split()
+            ),
+            "181-7А",
+        )
+
+    def test_extract_article_ignores_plain_sizes(self):
+        from marks_inventory import MarksInventory
+
+        self.assertEqual(
+            MarksInventory._extract_article("сапоги р.36-37 чёрные".split()),
+            "",
+        )
+
+    def test_extract_article_prefers_full_model_over_numeric(self):
+        from marks_inventory import MarksInventory
+
+        self.assertEqual(
+            MarksInventory._extract_article(
+                "Сабо COVANI SMS25-BHLM3-015H серые (37)".split()
+            ),
+            "COVANI SMS25-BHLM3-015H",
+        )
+
     def test_csv_search_index_augments_marks_without_replacing_original_structure(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)

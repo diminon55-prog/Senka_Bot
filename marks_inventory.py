@@ -50,6 +50,7 @@ class ClaimLocation:
     article: str
     page_number: int
     position_on_page: int
+    display_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -796,7 +797,8 @@ class MarksInventory:
         tokens = [word.strip("'‘’\".,;:()[]{}") for word in words]
         tokens = [token for token in tokens if token]
         upper_tokens = [token.upper() for token in tokens]
-        model_pattern = re.compile(r"[A-Z0-9$]{2,}(?:-[A-Z0-9]{2,})+")
+        model_pattern = re.compile(r"[A-ZА-ЯЁ0-9$]{2,}(?:-[A-ZА-ЯЁ0-9]{2,})+")
+        numeric_pattern = re.compile(r"(?<![0-9A-ZА-ЯЁ-])[0-9]+-[0-9]+[A-ZА-ЯЁ](?![0-9A-ZА-ЯЁ-])")
         candidates: list[str] = []
         for index, token in enumerate(upper_tokens):
             combined = token
@@ -807,6 +809,9 @@ class MarksInventory:
                     character.isdigit() for character in candidate
                 ):
                     candidates.append(candidate.strip("-"))
+        if not candidates:
+            for token in upper_tokens:
+                candidates.extend(numeric_pattern.findall(token))
         if not candidates:
             return ""
 
@@ -1329,7 +1334,7 @@ class MarksInventory:
             document_id = int(document_row["id"])
             rows = connection.execute(
                 """
-                SELECT m.*
+                SELECT m.*, i.display_name
                 FROM marks m
                 JOIN documents d ON d.id = m.document_id
                 LEFT JOIN mark_text_index i ON i.mark_id = m.id
@@ -1410,6 +1415,7 @@ class MarksInventory:
                     article=str(row["article"]),
                     page_number=int(row["page_index"]) + 1,
                     position_on_page=int(row["position_on_page"]),
+                    display_name=str(row["display_name"] or ""),
                 )
                 for row in rows
             ),
@@ -1676,9 +1682,10 @@ class MarksInventory:
             placeholders = ",".join("?" for _ in mark_ids)
             rows = connection.execute(
                 f"""
-                SELECT m.*, d.file_name, d.pdf_path
+                SELECT m.*, d.file_name, d.pdf_path, i.display_name
                 FROM marks m
                 JOIN documents d ON d.id = m.document_id
+                LEFT JOIN mark_text_index i ON i.mark_id = m.id
                 WHERE d.chat_id = ?
                   AND m.id IN ({placeholders})
                   AND m.status = 'available'
@@ -1750,6 +1757,7 @@ class MarksInventory:
                     article=str(row["article"]),
                     page_number=int(row["page_index"]) + 1,
                     position_on_page=int(row["position_on_page"]),
+                    display_name=str(row["display_name"] or ""),
                 )
                 for row in rows
             ),

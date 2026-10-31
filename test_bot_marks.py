@@ -28,8 +28,8 @@ class FakeSendingBot:
     def __init__(self):
         self.documents = []
 
-    def send_document(self, chat_id, document, caption=None):
-        self.documents.append((chat_id, document.name, document.read(), caption))
+    def send_document(self, chat_id, document, caption=None, parse_mode=None):
+        self.documents.append((chat_id, document.name, document.read(), caption, parse_mode))
 
 
 class FakeDocumentBot:
@@ -283,6 +283,7 @@ class BotMarksIntegrationTests(unittest.TestCase):
                 available=9,
                 pdf_bytes=b"%PDF-marked",
                 output_name="ready_marks_marked.pdf",
+                locations=(),
             )
         )
 
@@ -292,8 +293,60 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertIn("9", response)
         self.assertEqual(
             sending_bot.documents,
-            [(77, "ready_marks_marked.pdf", b"%PDF-marked", "✅ Найдено и отмечено: 1. Свободно: 9.")],
+            [(77, "ready_marks_marked.pdf", b"%PDF-marked", "✅ Найдено и отмечено: 1. Свободно: 9.", None)],
         )
+
+    def test_tool_find_marks_caption_lists_article_name_sheet_row_column(self):
+        bot_module = load_bot_module()
+        sending_bot = FakeSendingBot()
+        bot_module.bot = sending_bot
+        bot_module.active_chat_id = 77
+        bot_module.marks_store = SimpleNamespace(
+            grid_columns=8,
+            claim=lambda chat_id, query, quantity: SimpleNamespace(
+                matched=1,
+                available=9,
+                pdf_bytes=b"%PDF-marked",
+                output_name="ready_marks_marked.pdf",
+                locations=(
+                    SimpleNamespace(
+                        article="COVANI SMS25-BHLM3-015H",
+                        page_number=1,
+                        position_on_page=21,
+                        display_name="Ботинки COVANI SMS25",
+                    ),
+                ),
+            ),
+        )
+
+        response = bot_module.tool_find_marks("MARK-001", quantity=1)
+
+        self.assertIn("✅ Найдено и отмечено: 1. Свободно: 9.", response)
+        self.assertIn(
+            "<code>COVANI SMS25-BHLM3-015H</code> │ Ботинки COVANI SMS25 │ <u>л.1 №21 (р.3, к.5)</u>",
+            response,
+        )
+        self.assertEqual(len(sending_bot.documents), 1)
+        self.assertIn("№21", sending_bot.documents[0][3])
+        self.assertEqual(sending_bot.documents[0][4], "HTML")
+
+    def test_tool_find_marks_without_locations_keeps_old_caption(self):
+        bot_module = load_bot_module()
+        sending_bot = FakeSendingBot()
+        bot_module.bot = sending_bot
+        bot_module.active_chat_id = 77
+        bot_module.marks_store = SimpleNamespace(
+            claim=lambda chat_id, query, quantity: SimpleNamespace(
+                matched=1,
+                available=9,
+                pdf_bytes=b"%PDF-marked",
+                output_name="ready_marks_marked.pdf",
+            )
+        )
+
+        response = bot_module.tool_find_marks("MARK-001", quantity=1)
+
+        self.assertEqual(response, "✅ Найдено и отмечено: 1. Свободно: 9.")
 
     def test_tool_find_marks_routes_covani_article_to_article_search(self):
         bot_module = load_bot_module()
@@ -338,14 +391,15 @@ class BotMarksIntegrationTests(unittest.TestCase):
 
         response = bot_module.tool_find_article("COVANI SMS25-BHLM3")
 
-        self.assertIn("Ваша марка найдена, её порядковый номер: 17", response)
+        self.assertIn("<b>Марка найдена и отмечена!</b>", response)
         self.assertIn("COVANI SMS25-BHLM3-015H", response)
-        self.assertIn("лист 2", response.casefold())
-        self.assertIn("№17", response)
+        self.assertIn("<b>Лист:</b> 2", response)
+        self.assertIn("№ на листе:</b> 17", response)
         self.assertIn("9", response)
         self.assertEqual(len(sending_bot.documents), 1)
         self.assertEqual(sending_bot.documents[0][0], 77)
         self.assertEqual(sending_bot.documents[0][1], "ready_marks_marked.pdf")
+        self.assertEqual(sending_bot.documents[0][4], "HTML")
 
     def test_tool_find_article_reports_retryable_ocr_error_without_sending_pdf(self):
         bot_module = load_bot_module()
@@ -391,7 +445,7 @@ class BotMarksIntegrationTests(unittest.TestCase):
         bot_module = load_bot_module()
 
         class FailingSendingBot:
-            def send_document(self, chat_id, document, caption=None):
+            def send_document(self, chat_id, document, caption=None, parse_mode=None):
                 raise RuntimeError("telegram upload failed")
 
         releases = []
@@ -590,6 +644,8 @@ class BotMarksIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(bot_module.extract_plain_article("HELLO-WORLD"), "")
         self.assertEqual(bot_module.extract_plain_article("123-456"), "")
+        self.assertEqual(bot_module.extract_plain_article("181-7А"), "181-7А")
+        self.assertEqual(bot_module.extract_plain_article("36-37"), "")
 
     def test_gemini_persona_keeps_dry_humor_style(self):
         bot_module = load_bot_module()
@@ -877,7 +933,7 @@ class BotMarksIntegrationTests(unittest.TestCase):
         bot_module.handle_export(message)
 
         self.assertEqual(len(send_bot.documents), 1)
-        chat_id, name, payload, caption = send_bot.documents[0]
+        chat_id, name, payload, caption, parse_mode = send_bot.documents[0]
         self.assertEqual(chat_id, 77)
         self.assertTrue(name.endswith(".csv"))
         self.assertTrue(payload.startswith(b"\xef\xbb\xbf"))
@@ -999,8 +1055,10 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertEqual(len(reply_bot.replies), 1)
         reply = reply_bot.replies[0][0]
         self.assertIn("уже выбрана", reply.lower())
+        self.assertIn("27.10.2026 18:43 МСК", reply)
         self.assertIn("49", reply)
         self.assertIn("1", reply)
+        self.assertEqual(reply_bot.replies[0][1].get("parse_mode"), "HTML")
 
     def test_findarticle_reports_not_found_when_no_selected_match(self):
         bot_module = load_bot_module()

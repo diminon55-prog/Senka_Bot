@@ -1,4 +1,4 @@
-import os, re, zipfile, rarfile, io, telebot, time
+import os, re, zipfile, rarfile, io, telebot, time, html
 from pathlib import Path
 import pymupdf as fitz
 from contextvars import ContextVar
@@ -53,8 +53,8 @@ bot_stats = {"requests": 0, "tokens": 0}
 
 HELP_BUTTON_TEXT = "ℹ️ Что умеет Сеня?"
 PLAIN_ARTICLE_PATTERN = re.compile(
-    r"(?:COVANI\s+)?(?=[A-Z0-9$-]*[A-Z])(?=[A-Z0-9$-]*\d)"
-    r"[A-Z0-9$]{2,}(?:-[A-Z0-9$]{2,})+",
+    r"(?:COVANI\s+)?(?=[A-Z0-9$А-ЯЁ-]*[A-ZА-ЯЁ])(?=[A-Z0-9$А-ЯЁ-]*\d)"
+    r"[A-Z0-9$]{2,}(?:-[A-Z0-9$А-ЯЁ]{2,})+",
     re.IGNORECASE,
 )
 HELP_TEXT = (
@@ -104,8 +104,11 @@ def send_claimed_document(chat_id, result, caption):
     marked_pdf = io.BytesIO(result.pdf_bytes)
     marked_pdf.name = result.output_name
     claim_token = getattr(result, "claim_token", "")
+    send_kwargs = {"caption": caption}
+    if "<" in caption and ">" in caption:
+        send_kwargs["parse_mode"] = "HTML"
     try:
-        bot.send_document(chat_id, marked_pdf, caption=caption)
+        bot.send_document(chat_id, marked_pdf, **send_kwargs)
     except Exception as send_error:
         if claim_token:
             try:
@@ -116,6 +119,28 @@ def send_claimed_document(chat_id, result, caption):
     if claim_token:
         marks_store.finalize_claim(chat_id, claim_token)
     pending_suggestions.pop(chat_id, None)
+
+
+def format_selected_at_msk(selected_at: str) -> str:
+    """'2026-10-31 22:31:00' (UTC) -> '01.11.2026 01:31 МСК'."""
+    from datetime import datetime, timedelta, timezone
+
+    raw = (selected_at or "").strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
+        try:
+            moment = datetime.strptime(raw[:19], fmt).replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+        msk = moment.astimezone(timezone(timedelta(hours=3)))
+        return msk.strftime("%d.%m.%Y %H:%M") + " МСК"
+    return ""
+
+
+def reply_text(message, text):
+    """Reply with HTML parse mode when the text carries markup."""
+    if "<" in text and ">" in text:
+        return bot.reply_to(message, text, parse_mode="HTML")
+    return bot.reply_to(message, text)
 
 
 CANCEL_WORDS = frozenset({"отмена", "отменить", "отбой", "стоп", "хватит"})
@@ -321,6 +346,31 @@ def tool_process_cz_archive(num_shift_x_mm: float = 0.0, num_shift_y_mm: float =
     except Exception as e:
         return f"Ошибка обработки ЧЗ: {e}"
 
+def claim_location_details(result) -> str:
+    """HTML-таблица «Артикул | Название | Лист | № | Ряд | Колонка» по выбранным маркам."""
+    grid_columns = max(1, int(getattr(marks_store, "grid_columns", 8) or 8))
+    rows = []
+    for loc in getattr(result, "locations", None) or ():
+        position = int(getattr(loc, "position_on_page", 0) or 0)
+        if position >= 1:
+            row_number = (position - 1) // grid_columns + 1
+            column_number = (position - 1) % grid_columns + 1
+            where = (
+                f"л.{loc.page_number} №{position} "
+                f"(р.{row_number}, к.{column_number})"
+            )
+        else:
+            where = f"л.{loc.page_number}"
+        article = html.escape(getattr(loc, "article", "") or "—")
+        name = html.escape(getattr(loc, "display_name", "") or "—")
+        rows.append(
+            f"<code>{article}</code> │ {name} │ <u>{where}</u>"
+        )
+    if not rows:
+        return ""
+    return "<b>📍 Расположение:</b>\n" + "\n".join(rows)
+
+
 def tool_find_marks(query: str, quantity: int = 1) -> str:
     """Находит свободные марки по Data Matrix или названию и помечает их зелёным."""
     chat_id = get_active_chat_id()
@@ -336,6 +386,9 @@ def tool_find_marks(query: str, quantity: int = 1) -> str:
         return f"Марки по запросу '{query}' не найдены. Свободно: {result.available}."
 
     caption = f"✅ Найдено и отмечено: {result.matched}. Свободно: {result.available}."
+    details = claim_location_details(result)
+    if details:
+        caption = f"{caption}\n{details}"
     send_claimed_document(chat_id, result, caption)
     return caption
 
@@ -353,12 +406,16 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
             pending_mark_selection[chat_id] = [m.id for m in matches]
             lines = []
             for idx, m in enumerate(matches, 1):
-                doc_name = f"doc_{m.document_id}"
-                lines.append(f"{idx}. {m.display_name or m.article} (лист {m.page_number}, №{m.position_on_page}, {doc_name})")
+                name = html.escape(m.display_name or m.article or "—")
+                lines.append(
+                    f"<b>{idx}.</b> {name}\n"
+                    f"    └ <i>лист {m.page_number}, №{m.position_on_page}</i>"
+                )
             return (
-                f"По артикулу '{article}' найдено {len(matches)} марок:\n"
+                f"🔎 По артикулу <code>{html.escape(article)}</code> "
+                f"найдено <b>{len(matches)}</b> марок:\n\n"
                 + "\n".join(lines)
-                + "\n\nВведи номер (1, 2...), несколько номеров через запятую, или «все»."
+                + "\n\n<i>Введи номер (1, 2...), несколько через запятую, или «все».</i>"
             )
 
     try:
@@ -372,10 +429,13 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
         selected = marks_store.selected_marks_by_query(chat_id, article)
         if selected:
             first = selected[0]
+            when = format_selected_at_msk(first.selected_at) or "время не записано"
             return (
-                f"⚠️ Марка '{article}' уже выбрана ранее: лист {first.page_number}, "
-                f"№{first.position_on_page}. Если нужно вернуть её в базу — "
-                f"/unmark {article}. Остаток: {result.available}."
+                f"⚠️ Марка <code>{html.escape(article)}</code> уже выбрана ранее "
+                f"(<i>{html.escape(when)}</i>):\n"
+                f"    └ лист {first.page_number}, №{first.position_on_page}\n\n"
+                f"Вернуть её в базу — /unmark {html.escape(article)}. "
+                f"Остаток: {result.available}."
             )
         return (
             f"Свободные марки с артикулом '{article}' не найдены — "
@@ -388,22 +448,23 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
         location = result.locations[0]
         source_name = Path(str(result.output_name)).stem.replace("_marked", "")
         caption = (
-            f"✅ Ваша марка найдена, её порядковый номер: {location.position_on_page} "
-            f"(№{location.position_on_page}). Лист {location.page_number}. "
-            f"Артикул: {location.article or article}. "
-            f"Источник: {source_name}. "
-            f"Свободно: {result.available}."
+            f"✅ <b>Марка найдена и отмечена!</b>\n"
+            f"<blockquote>"
+            f"<b>Артикул:</b> <code>{html.escape(location.article or article)}</code>\n"
+            f"<b>Лист:</b> {location.page_number}  <b>№ на листе:</b> {location.position_on_page}\n"
+            f"<b>Источник:</b> {html.escape(source_name)}\n"
+            f"</blockquote>"
+            f"Свободно: <b>{result.available}</b>."
         )
     else:
-        positions = "; ".join(
-            f"{location.article or article}: лист {location.page_number}, №{location.position_on_page}"
-            for location in result.locations
-        )
         source_name = Path(str(result.output_name)).stem.replace("_marked", "")
         caption = (
-            f"✅ По артикулу найдено и отмечено: {result.matched}. "
-            f"Позиции: {positions}. Источник: {source_name}. Свободно: {result.available}."
+            f"✅ <b>По артикулу найдено и отмечено: {result.matched}.</b>\n"
+            f"Источник: {html.escape(source_name)}. Свободно: <b>{result.available}</b>."
         )
+        details = claim_location_details(result)
+        if details:
+            caption = f"{caption}\n{details}"
     send_claimed_document(chat_id, result, caption)
     return caption
 
@@ -530,7 +591,7 @@ def handle_findarticle(message):
 
     response = tool_find_article(article, quantity)
     if not response.startswith("✅"):
-        bot.reply_to(message, response)
+        reply_text(message, response)
 
 
 @bot.message_handler(commands=['markstats', 'остаток'])
@@ -718,12 +779,10 @@ def handle_media(message):
                 except ArticleOcrError:
                     article_response = "OCR не завершён"
                 if article_response.startswith("✅"):
-                    bot.reply_to(message, article_response)
+                    reply_text(message, article_response)
                 else:
-                    bot.reply_to(
-                        message,
-                        f"Марка «{query}» в базе не найдена — свободных нет.",
-                    )
+                    reply_text(message, article_response)
+                    return
     except Exception as e:
         handle_ai_error(e, chat_id, message, thinking_msg)
 
@@ -830,9 +889,13 @@ def handle_text(message):
             if result.matched:
                 source_name = Path(str(result.output_name)).stem.replace("_marked", "")
                 caption = (
-                    f"✅ Отмечено марок: {result.matched}. "
-                    f"Источник: {source_name}. Свободно: {result.available}."
+                    f"✅ <b>Отмечено марок: {result.matched}.</b>\n"
+                    f"Источник: {html.escape(source_name)}. "
+                    f"Свободно: <b>{result.available}</b>."
                 )
+                details = claim_location_details(result)
+                if details:
+                    caption = f"{caption}\n{details}"
                 send_claimed_document(chat_id, result, caption)
             return
         # Парсим номера
@@ -848,14 +911,14 @@ def handle_text(message):
             result = marks_store.claim_specific_marks(chat_id, selected_ids)
             if result.matched:
                 source_name = Path(str(result.output_name)).stem.replace("_marked", "")
-                positions = "; ".join(
-                    f"{loc.article}: лист {loc.page_number}, №{loc.position_on_page}"
-                    for loc in result.locations
-                )
                 caption = (
-                    f"✅ Отмечено марок: {result.matched}. "
-                    f"Позиции: {positions}. Источник: {source_name}. Свободно: {result.available}."
+                    f"✅ <b>Отмечено марок: {result.matched}.</b>\n"
+                    f"Источник: {html.escape(source_name)}. "
+                    f"Свободно: <b>{result.available}</b>."
                 )
+                details = claim_location_details(result)
+                if details:
+                    caption = f"{caption}\n{details}"
                 send_claimed_document(chat_id, result, caption)
             return
     article = extract_plain_article(message.text)
@@ -870,7 +933,7 @@ def handle_text(message):
         if response.startswith("✅"):
             pending_suggestions.pop(chat_id, None)
         else:
-            bot.reply_to(message, response)
+            reply_text(message, response)
         return
     try:
         thinking_msg = bot.reply_to(message, "<blockquote>⚙️ Думаю...</blockquote>", parse_mode="HTML")
@@ -923,7 +986,7 @@ def handle_voice(message):
         if article:
             response = tool_find_article(article)
             if not response.startswith("✅"):
-                bot.reply_to(message, response)
+                reply_text(message, response)
             return
         response = tool_find_marks(text, quantity=1)
         if response.startswith("✅"):
