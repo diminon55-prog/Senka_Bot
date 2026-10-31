@@ -1593,7 +1593,7 @@ class MarksInventory:
             released = connection.total_changes
         return released
 
-    def export_selected_marks(self, chat_id: int) -> bytes | None:
+    def export_selected_marks(self, chat_id: int, delimiter: str = ";") -> bytes | None:
         with self._connection() as connection:
             rows = connection.execute(
                 """
@@ -1610,7 +1610,7 @@ class MarksInventory:
         if not rows:
             return None
         output = io.StringIO()
-        writer = csv.writer(output, delimiter=",", lineterminator="\n")
+        writer = csv.writer(output, delimiter=delimiter, lineterminator="\n")
         writer.writerow(
             [
                 "Артикул",

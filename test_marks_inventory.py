@@ -1881,7 +1881,7 @@ class MarksInventoryTests(unittest.TestCase):
 
             self.assertIsNotNone(csv_bytes)
             text = csv_bytes.decode("utf-8-sig")
-            rows = list(csv.reader(io.StringIO(text), delimiter=","))
+            rows = list(csv.reader(io.StringIO(text), delimiter=";"))
             self.assertEqual(
                 rows[0],
                 [

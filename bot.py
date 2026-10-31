@@ -923,32 +923,99 @@ def handle_unmark(message):
 
 @bot.message_handler(commands=['export', 'экспорт'])
 def handle_export(message):
-    set_active_chat_id(message.chat.id)
-    csv_bytes = marks_store.export_selected_marks(message.chat.id)
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keyboard.row(
+        telebot.types.InlineKeyboardButton(
+            "📊 Excel (точка с запятой)", callback_data="exp:;"
+        ),
+        telebot.types.InlineKeyboardButton(
+            "📄 Текст (запятая)", callback_data="exp:,"
+        ),
+    )
+    bot.send_message(
+        chat_id,
+        "📤 <b>Выгрузка выбранных марок в CSV</b>\n\n"
+        "Выбери формат:\n"
+        "• <b>Excel</b> — точка с запятой, разбивается по колонкам в русском Excel\n"
+        "• <b>Текст</b> — запятая, универсальный текстовый формат",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("exp:"))
+def handle_export_callback(call):
+    chat_id = call.message.chat.id
+    set_active_chat_id(chat_id)
+    delimiter = call.data.split(":", 1)[1]
+    if delimiter not in (";", ","):
+        bot.answer_callback_query(call.id, "Некорректный формат.")
+        return
+    csv_bytes = marks_store.export_selected_marks(chat_id, delimiter=delimiter)
+    bot.answer_callback_query(call.id)
+    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
     if csv_bytes is None:
-        bot.reply_to(message, "Нет выбранных марок для выгрузки.")
+        bot.send_message(chat_id, "Нет выбранных марок для выгрузки.")
         return
     export_file = io.BytesIO(csv_bytes)
-    export_file.name = f"selected_marks_{message.chat.id}.csv"
+    export_file.name = f"selected_marks_{chat_id}.csv"
+    fmt = "Excel (;)" if delimiter == ";" else "текст (,)"
     bot.send_document(
-        message.chat.id,
+        chat_id,
         export_file,
-        caption="Выбранные марки в CSV: артикул, название, лист, позиция, время выбора.",
+        caption=f"✅ Выбранные марки в CSV ({fmt}): артикул, название, документ, лист, позиция, время выбора.",
     )
 
 
 @bot.message_handler(commands=['resetmarks', 'сброс'])
 def handle_resetmarks(message):
-    set_active_chat_id(message.chat.id)
-    released = marks_store.reset_inventory(message.chat.id)
-    if released:
-        stats = marks_store.stats(message.chat.id)
-        bot.reply_to(
-            message,
-            f"✅ Сбросил {released} выбранных марок. Свободно теперь: {stats.available}.",
-        )
-    else:
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
+    stats = marks_store.stats(chat_id)
+    if stats.selected == 0:
         bot.reply_to(message, "Нет выбранных марок для сброса.")
+        return
+    keyboard = telebot.types.InlineKeyboardMarkup()
+    keyboard.row(
+        telebot.types.InlineKeyboardButton(
+            "✅ Да, сбросить всё", callback_data="rst:yes"
+        ),
+        telebot.types.InlineKeyboardButton(
+            "❌ Отмена", callback_data="rst:no"
+        ),
+    )
+    bot.send_message(
+        chat_id,
+        f"⚠️ <b>Сбросить ВСЕ выбранные марки?</b>\n\n"
+        f"Сейчас выбрано: <b>{stats.selected}</b>. "
+        f"Все они вернутся в «свободные», а зелёные разметки в ранее "
+        f"отправленных PDF останутся как есть.\n\n"
+        f"<i>Действие необратимо без повторного выбора.</i>",
+        parse_mode="HTML",
+        reply_markup=keyboard,
+    )
+
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith("rst:"))
+def handle_resetmarks_callback(call):
+    chat_id = call.message.chat.id
+    set_active_chat_id(chat_id)
+    decision = call.data.split(":", 1)[1]
+    bot.answer_callback_query(call.id)
+    bot.edit_message_reply_markup(chat_id, call.message.message_id, reply_markup=None)
+    if decision != "yes":
+        bot.send_message(chat_id, "Отменил сброс. Марки остались выбранными.")
+        return
+    released = marks_store.reset_inventory(chat_id)
+    stats = marks_store.stats(chat_id)
+    bot.send_message(
+        chat_id,
+        f"✅ <b>Сбросил {released} выбранных марок.</b> "
+        f"Свободно теперь: <b>{stats.available}</b>.",
+        parse_mode="HTML",
+    )
 
 
 @bot.message_handler(commands=['list', 'список'])

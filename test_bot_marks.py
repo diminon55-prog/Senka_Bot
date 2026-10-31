@@ -1150,47 +1150,165 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertEqual(len(reply_bot.replies), 1)
         self.assertIn("не наш", reply_bot.replies[0][0].lower())
 
-    def test_export_command_sends_csv_document(self):
+    def test_export_command_shows_format_keyboard(self):
         bot_module = load_bot_module()
-        send_bot = FakeSendingBot()
-        send_bot.replies = []
-        send_bot.reply_to = lambda message, text, **kwargs: send_bot.replies.append(
-            text
-        )
-        bot_module.bot = send_bot
-        bot_module.marks_store = SimpleNamespace(
-            export_selected_marks=lambda chat_id: (
-                "Артикул;Название\nA;B\n".encode("utf-8-sig")
-            )
-        )
+
+        class FakeUiBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        ui_bot = FakeUiBot()
+        bot_module.bot = ui_bot
         message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/export")
 
         bot_module.handle_export(message)
 
-        self.assertEqual(len(send_bot.documents), 1)
-        chat_id, name, payload, caption, parse_mode = send_bot.documents[0]
+        self.assertEqual(len(ui_bot.replies), 1)
+        text, kwargs = ui_bot.replies[0]
+        self.assertIn("Выгрузка", text)
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        keyboard = kwargs.get("reply_markup")
+        self.assertIsNotNone(keyboard)
+        callbacks = [b.callback_data for row in keyboard.keyboard for b in row]
+        self.assertIn("exp:;", callbacks)
+        self.assertIn("exp:,", callbacks)
+
+    def test_export_callback_sends_csv_with_chosen_delimiter(self):
+        bot_module = load_bot_module()
+
+        class FakeExportBot(FakeSendingBot):
+            def __init__(self):
+                super().__init__()
+                self.answered = []
+                self.edited = []
+                self.sent_messages = []
+
+            def answer_callback_query(self, call_id, text=None):
+                self.answered.append(call_id)
+
+            def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+                self.edited.append(message_id)
+
+            def send_message(self, chat_id, text, **kwargs):
+                pass
+
+        export_bot = FakeExportBot()
+        bot_module.bot = export_bot
+        delimiters = []
+        bot_module.marks_store = SimpleNamespace(
+            export_selected_marks=lambda chat_id, delimiter=";": (
+                delimiters.append(delimiter)
+                or "Артикул,Название\nA,B\n".encode("utf-8-sig")
+            )
+        )
+        call = SimpleNamespace(
+            id="cb1",
+            data="exp:,",
+            message=SimpleNamespace(chat=SimpleNamespace(id=77), message_id=55),
+        )
+
+        bot_module.handle_export_callback(call)
+
+        self.assertEqual(delimiters, [","])
+        self.assertEqual(len(export_bot.documents), 1)
+        chat_id, name, payload, caption, parse_mode = export_bot.documents[0]
         self.assertEqual(chat_id, 77)
         self.assertTrue(name.endswith(".csv"))
         self.assertTrue(payload.startswith(b"\xef\xbb\xbf"))
+        self.assertIn("(,)", caption)
 
-    def test_export_command_reports_empty_selection(self):
+    def test_export_callback_reports_empty_selection(self):
         bot_module = load_bot_module()
-        reply_bot = FakePhotoBot(b"")
-        bot_module.bot = reply_bot
+
+        class FakeExportBot(FakeSendingBot):
+            def __init__(self):
+                super().__init__()
+                self.sent_messages = []
+
+            def answer_callback_query(self, call_id, text=None):
+                pass
+
+            def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+                pass
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.sent_messages.append(text)
+
+        export_bot = FakeExportBot()
+        bot_module.bot = export_bot
         bot_module.marks_store = SimpleNamespace(
-            export_selected_marks=lambda chat_id: None
+            export_selected_marks=lambda chat_id, delimiter=";": None
         )
-        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/export")
+        call = SimpleNamespace(
+            id="cb2",
+            data="exp:;",
+            message=SimpleNamespace(chat=SimpleNamespace(id=77), message_id=55),
+        )
 
-        bot_module.handle_export(message)
+        bot_module.handle_export_callback(call)
 
-        self.assertEqual(len(reply_bot.replies), 1)
-        self.assertIn("нет выбранных", reply_bot.replies[0][0].lower())
+        self.assertEqual(len(export_bot.documents), 0)
+        self.assertIn("нет выбранных", export_bot.sent_messages[0].lower())
 
-    def test_resetmarks_command_resets_and_reports(self):
+    def test_resetmarks_command_asks_for_confirmation(self):
         bot_module = load_bot_module()
-        reply_bot = FakePhotoBot(b"")
-        bot_module.bot = reply_bot
+
+        class FakeUiBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        ui_bot = FakeUiBot()
+        bot_module.bot = ui_bot
+        calls = []
+        bot_module.marks_store = SimpleNamespace(
+            reset_inventory=lambda chat_id: (calls.append(chat_id) or 5),
+            stats=lambda chat_id: SimpleNamespace(
+                total=10, available=5, selected=5
+            ),
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/resetmarks")
+
+        bot_module.handle_resetmarks(message)
+
+        self.assertEqual(calls, [])  # сброс НЕ вызван
+        self.assertEqual(len(ui_bot.replies), 1)
+        text, kwargs = ui_bot.replies[0]
+        self.assertIn("Сбросить ВСЕ", text)
+        self.assertIn("5", text)
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
+        keyboard = kwargs.get("reply_markup")
+        self.assertIsNotNone(keyboard)
+        callbacks = [b.callback_data for row in keyboard.keyboard for b in row]
+        self.assertIn("rst:yes", callbacks)
+        self.assertIn("rst:no", callbacks)
+
+    def test_resetmarks_callback_confirms_and_resets(self):
+        bot_module = load_bot_module()
+
+        class FakeResetBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def answer_callback_query(self, call_id, text=None):
+                pass
+
+            def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+                pass
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        reset_bot = FakeResetBot()
+        bot_module.bot = reset_bot
         calls = []
         bot_module.marks_store = SimpleNamespace(
             reset_inventory=lambda chat_id: (calls.append(chat_id) or 5),
@@ -1198,21 +1316,59 @@ class BotMarksIntegrationTests(unittest.TestCase):
                 total=10, available=10, selected=0
             ),
         )
-        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/resetmarks")
+        call = SimpleNamespace(
+            id="cb1",
+            data="rst:yes",
+            message=SimpleNamespace(chat=SimpleNamespace(id=77), message_id=55),
+        )
 
-        bot_module.handle_resetmarks(message)
+        bot_module.handle_resetmarks_callback(call)
 
         self.assertEqual(calls, [77])
-        self.assertEqual(len(reply_bot.replies), 1)
-        self.assertIn("сбросил", reply_bot.replies[0][0].lower())
-        self.assertIn("5", reply_bot.replies[0][0])
+        self.assertIn("Сбросил", reset_bot.replies[0][0])
+        self.assertIn("5", reset_bot.replies[0][0])
+
+    def test_resetmarks_callback_cancel_keeps_selection(self):
+        bot_module = load_bot_module()
+
+        class FakeResetBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def answer_callback_query(self, call_id, text=None):
+                pass
+
+            def edit_message_reply_markup(self, chat_id, message_id, reply_markup=None):
+                pass
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        reset_bot = FakeResetBot()
+        bot_module.bot = reset_bot
+        calls = []
+        bot_module.marks_store = SimpleNamespace(
+            reset_inventory=lambda chat_id: calls.append(chat_id),
+        )
+        call = SimpleNamespace(
+            id="cb2",
+            data="rst:no",
+            message=SimpleNamespace(chat=SimpleNamespace(id=77), message_id=55),
+        )
+
+        bot_module.handle_resetmarks_callback(call)
+
+        self.assertEqual(calls, [])  # сброс НЕ вызван
+        self.assertIn("Отменил", reset_bot.replies[0][0])
 
     def test_resetmarks_command_reports_empty_selection(self):
         bot_module = load_bot_module()
         reply_bot = FakePhotoBot(b"")
         bot_module.bot = reply_bot
+        calls = []
         bot_module.marks_store = SimpleNamespace(
-            reset_inventory=lambda chat_id: 0,
+            reset_inventory=lambda chat_id: calls.append(chat_id),
             stats=lambda chat_id: SimpleNamespace(
                 total=10, available=10, selected=0
             ),
@@ -1221,6 +1377,7 @@ class BotMarksIntegrationTests(unittest.TestCase):
 
         bot_module.handle_resetmarks(message)
 
+        self.assertEqual(calls, [])
         self.assertEqual(len(reply_bot.replies), 1)
         self.assertIn("нет выбранных", reply_bot.replies[0][0].lower())
 
