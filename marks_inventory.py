@@ -1598,7 +1598,7 @@ class MarksInventory:
             rows = connection.execute(
                 """
                 SELECT m.article, m.page_index, m.position_on_page, m.selected_at,
-                       i.display_name, i.short_code
+                       i.display_name, i.short_code, d.product_name, d.file_name
                 FROM marks m
                 JOIN documents d ON d.id = m.document_id
                 LEFT JOIN mark_text_index i ON i.mark_id = m.id
@@ -1610,11 +1610,12 @@ class MarksInventory:
         if not rows:
             return None
         output = io.StringIO()
-        writer = csv.writer(output, delimiter=";", lineterminator="\n")
+        writer = csv.writer(output, delimiter=",", lineterminator="\n")
         writer.writerow(
             [
                 "Артикул",
                 "Название",
+                "Документ",
                 "Лист",
                 "Позиция на листе",
                 "Выбрана",
@@ -1626,6 +1627,7 @@ class MarksInventory:
                 [
                     str(row["article"] or ""),
                     str(row["display_name"] or ""),
+                    str(row["product_name"] or row["file_name"] or ""),
                     int(row["page_index"]) + 1,
                     int(row["position_on_page"]),
                     str(row["selected_at"] or ""),

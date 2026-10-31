@@ -1881,12 +1881,13 @@ class MarksInventoryTests(unittest.TestCase):
 
             self.assertIsNotNone(csv_bytes)
             text = csv_bytes.decode("utf-8-sig")
-            rows = list(csv.reader(io.StringIO(text), delimiter=";"))
+            rows = list(csv.reader(io.StringIO(text), delimiter=","))
             self.assertEqual(
                 rows[0],
                 [
                     "Артикул",
                     "Название",
+                    "Документ",
                     "Лист",
                     "Позиция на листе",
                     "Выбрана",
@@ -1895,9 +1896,10 @@ class MarksInventoryTests(unittest.TestCase):
             )
             self.assertEqual(len(rows), 2)
             self.assertEqual(rows[1][0], "COVANI SMS25-BHLM3-015H")
-            self.assertEqual(rows[1][2], "1")
+            self.assertEqual(rows[1][2], "Марки")
             self.assertEqual(rows[1][3], "1")
-            self.assertNotEqual(rows[1][4], "")
+            self.assertEqual(rows[1][4], "1")
+            self.assertNotEqual(rows[1][5], "")
 
     def test_export_selected_marks_returns_none_when_nothing_selected(self):
         with tempfile.TemporaryDirectory() as temp_dir:
