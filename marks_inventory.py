@@ -82,6 +82,7 @@ class SelectedMarkInfo:
     page_number: int
     position_on_page: int
     selected_at: str
+    document_name: str = ""
 
 
 class ArticleOcrError(RuntimeError):
@@ -1593,6 +1594,33 @@ class MarksInventory:
             released = connection.total_changes
         return released
 
+    def list_selected_marks(self, chat_id: int) -> list[dict[str, Any]]:
+        """Выбранные марки чата для /list: артикул, название, документ, лист, позиция, время."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT m.article, m.page_index, m.position_on_page, m.selected_at,
+                       i.display_name, d.product_name, d.file_name
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                WHERE d.chat_id = ? AND m.status = 'selected'
+                ORDER BY m.selected_at DESC, m.page_index, m.position_on_page
+                """,
+                (chat_id,),
+            ).fetchall()
+        return [
+            {
+                "article": str(row["article"] or ""),
+                "name": str(row["display_name"] or row["article"] or ""),
+                "document": str(row["product_name"] or row["file_name"] or ""),
+                "page": int(row["page_index"]) + 1,
+                "position": int(row["position_on_page"]),
+                "selected_at": str(row["selected_at"] or ""),
+            }
+            for row in rows
+        ]
+
     def export_selected_marks(self, chat_id: int, delimiter: str = ";") -> bytes | None:
         with self._connection() as connection:
             rows = connection.execute(
@@ -1635,6 +1663,73 @@ class MarksInventory:
                 ]
             )
         return output.getvalue().encode("utf-8-sig")
+
+    def find_names_containing(self, chat_id: int, words: list[str], limit: int = 10) -> list[str]:
+        """Ищет названия марок, содержащие все указанные слова (для поиска по цвету/названию)."""
+        if not words:
+            return []
+        with self._connection() as connection:
+            conditions = " AND ".join(
+                "i.normalized_display_name LIKE ? ESCAPE '!'" for _ in words
+            )
+            params = [chat_id] + [
+                f"%{escape_like(normalize_code(word))}%" for word in words
+            ]
+            rows = connection.execute(
+                f"""
+                SELECT DISTINCT i.display_name
+                FROM mark_text_index i
+                JOIN marks m ON m.id = i.mark_id
+                JOIN documents d ON d.id = m.document_id
+                WHERE d.chat_id = ?
+                  AND m.status = 'available'
+                  AND {conditions}
+                ORDER BY i.display_name
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [str(row["display_name"]) for row in rows]
+
+    def find_available_by_words(
+        self, chat_id: int, words: list[str], limit: int = 50
+    ) -> list[AvailableMarkInfo]:
+        """Свободные марки, чьи названия содержат все слова (для интерактивного поиска)."""
+        if not words:
+            return []
+        with self._connection() as connection:
+            conditions = " AND ".join(
+                "i.normalized_display_name LIKE ? ESCAPE '!'" for _ in words
+            )
+            params = [chat_id] + [
+                f"%{escape_like(normalize_code(word))}%" for word in words
+            ]
+            rows = connection.execute(
+                f"""
+                SELECT m.id, m.article, m.page_index, m.position_on_page,
+                       i.display_name, m.document_id
+                FROM marks m
+                JOIN documents d ON d.id = m.document_id
+                LEFT JOIN mark_text_index i ON i.mark_id = m.id
+                WHERE d.chat_id = ?
+                  AND m.status = 'available'
+                  AND {conditions}
+                ORDER BY m.page_index, m.position_on_page
+                LIMIT ?
+                """,
+                (*params, limit),
+            ).fetchall()
+        return [
+            AvailableMarkInfo(
+                id=int(row["id"]),
+                article=str(row["article"] or ""),
+                page_number=int(row["page_index"]) + 1,
+                position_on_page=int(row["position_on_page"]),
+                display_name=str(row["display_name"] or ""),
+                document_id=int(row["document_id"]),
+            )
+            for row in rows
+        ]
 
     def suggest_similar(
         self,
@@ -1847,14 +1942,17 @@ class MarksInventory:
         if not name_query or not normalized_query:
             return []
         code_pattern = f"%{escape_like(normalized_query)}%"
-        name_pattern = f"%{escape_like(name_query)}%"
+        # normalized_display_name / normalized_short_code хранятся без пробелов,
+        # поэтому LIKE по ним должен идти по нормализованному запросу, а не по сырому тексту
+        name_pattern = f"%{escape_like(normalized_query)}%"
         article_prefix = f"{escape_like(normalized_query)}-%"
         branded_query = f"covani{normalized_query}"
         branded_prefix = f"{escape_like(branded_query)}-%"
         with self._connection() as connection:
             rows = connection.execute(
                 """
-                SELECT m.article, m.page_index, m.position_on_page, m.selected_at
+                SELECT m.article, m.page_index, m.position_on_page, m.selected_at,
+                       d.product_name, d.file_name
                 FROM marks m
                 JOIN documents d ON d.id = m.document_id
                 LEFT JOIN mark_text_index i ON i.mark_id = m.id
@@ -1893,6 +1991,7 @@ class MarksInventory:
                 page_number=int(row["page_index"]) + 1,
                 position_on_page=int(row["position_on_page"]),
                 selected_at=str(row["selected_at"] or ""),
+                document_name=str(row["product_name"] or row["file_name"] or ""),
             )
             for row in rows
         ]

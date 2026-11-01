@@ -864,6 +864,77 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertIn("unm:all:0", callbacks)
         self.assertIn("unm:cancel:0", callbacks)
 
+    def test_tool_find_marks_reports_already_selected_mark(self):
+        bot_module = load_bot_module()
+        bot_module.active_chat_id = 77
+        bot_module.marks_store = SimpleNamespace(
+            claim=lambda chat_id, query, quantity: SimpleNamespace(
+                matched=0, available=892, locations=(),
+            ),
+            selected_marks_by_query=lambda chat_id, query: [
+                SimpleNamespace(
+                    article="181-7А",
+                    page_number=2,
+                    position_on_page=39,
+                    selected_at="2026-11-01 15:56:00",
+                    document_name="OBEDINENO",
+                )
+            ],
+            grid_columns=8,
+        )
+
+        response = bot_module.tool_find_marks('босоножки "ЭВАЛИ" 181-7А р.40 молочный', quantity=1)
+
+        self.assertIn("уже выбрана", response.lower())
+        self.assertIn("01.11.2026 18:56 МСК", response)
+        self.assertIn("OBEDINENO", response)
+        self.assertIn("лист 2", response)
+        self.assertIn("39", response)
+        self.assertIn("892", response)
+
+    def test_text_with_color_word_shows_matches_with_buttons(self):
+        bot_module = load_bot_module()
+
+        class FakeUiBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        ui_bot = FakeUiBot()
+        bot_module.bot = ui_bot
+        bot_module.active_chat_id = 77
+        bot_module.pending_mark_selection.clear()
+        gemini_called = []
+        bot_module.get_chat_session = lambda chat_id: gemini_called.append(chat_id) or SimpleNamespace(
+            send_message=lambda text: SimpleNamespace(text="ответ Gemini")
+        )
+        bot_module.marks_store = SimpleNamespace(
+            find_available_by_words=lambda chat_id, words: [
+                SimpleNamespace(id=101, article="С3661-25", page_number=6,
+                                position_on_page=21, display_name='кроссовки "СТРОББС" С3661-25 р.43 оранжевый',
+                                document_id=1),
+            ] if "оранжевый" in words else [],
+            list_documents=lambda chat_id: [],
+        )
+        message = SimpleNamespace(chat=SimpleNamespace(id=77), text="а оранжевый еще есть?")
+
+        bot_module.handle_text(message)
+
+        self.assertEqual(gemini_called, [])
+        self.assertEqual(len(ui_bot.replies), 1)
+        text, kwargs = ui_bot.replies[0]
+        self.assertIn("оранжевый", text)
+        self.assertIn("С3661-25", text)
+        keyboard = kwargs.get("reply_markup")
+        self.assertIsNotNone(keyboard)
+        labels = [b.text for row in keyboard.keyboard for b in row]
+        self.assertIn("✅ Отметить", labels)
+        self.assertIn("❌ Отмена", labels)
+        self.assertEqual(bot_module.pending_mark_selection.get(77), [101])
+
     def test_plain_article_classifier_requires_letters_and_digits(self):
         bot_module = load_bot_module()
 
@@ -1383,34 +1454,45 @@ class BotMarksIntegrationTests(unittest.TestCase):
 
     def test_list_selected_marks_returns_table_text(self):
         bot_module = load_bot_module()
-        reply_bot = FakePhotoBot(b"")
-        bot_module.bot = reply_bot
+
+        class FakeUiBot(FakePhotoBot):
+            def __init__(self):
+                super().__init__(b"")
+
+            def send_message(self, chat_id, text, **kwargs):
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=1)
+
+        ui_bot = FakeUiBot()
+        bot_module.bot = ui_bot
         bot_module.marks_store = SimpleNamespace(
-            export_selected_marks=lambda chat_id: (
-                "Артикул;Название;Лист;Позиция на листе;Выбрана;Короткий код\n"
-                "A1;Ботинки;1;1;2026-10-27 10:00:00;CODE1\n"
-                "A2;Туфли;2;5;2026-10-27 11:00:00;CODE2\n"
-            ).encode("utf-8-sig")
+            list_selected_marks=lambda chat_id: [
+                {"article": "A1", "name": "Ботинки", "document": "OBEDINENO",
+                 "page": 1, "position": 1, "selected_at": "2026-10-27 10:00:00"},
+                {"article": "A2", "name": "Туфли", "document": "Новая партия",
+                 "page": 2, "position": 5, "selected_at": "2026-10-27 11:00:00"},
+            ]
         )
         message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/list")
 
         bot_module.handle_list(message)
 
-        self.assertEqual(len(reply_bot.replies), 1)
-        reply = reply_bot.replies[0][0]
-        self.assertIn("A1", reply)
-        self.assertIn("A2", reply)
-        self.assertIn("Ботинки", reply)
-        self.assertIn("Туфли", reply)
-        self.assertIn("1", reply)
-        self.assertIn("2", reply)
+        self.assertEqual(len(ui_bot.replies), 1)
+        text, kwargs = ui_bot.replies[0]
+        self.assertIn("A1", text)
+        self.assertIn("A2", text)
+        self.assertIn("Ботинки", text)
+        self.assertIn("Туфли", text)
+        self.assertIn("OBEDINENO", text)
+        self.assertIn("Новая партия", text)
+        self.assertEqual(kwargs.get("parse_mode"), "HTML")
 
     def test_list_selected_marks_reports_empty(self):
         bot_module = load_bot_module()
         reply_bot = FakePhotoBot(b"")
         bot_module.bot = reply_bot
         bot_module.marks_store = SimpleNamespace(
-            export_selected_marks=lambda chat_id: None
+            list_selected_marks=lambda chat_id: []
         )
         message = SimpleNamespace(chat=SimpleNamespace(id=77), text="/list")
 
@@ -1433,9 +1515,11 @@ class BotMarksIntegrationTests(unittest.TestCase):
                     page_number=1,
                     position_on_page=49,
                     selected_at="2026-10-27 15:43:28",
+                    document_name="OBEDINENO",
                 )
             ],
             find_available_by_article=lambda chat_id, article: [],
+            grid_columns=8,
         )
         message = SimpleNamespace(
             chat=SimpleNamespace(id=77),
@@ -1449,7 +1533,9 @@ class BotMarksIntegrationTests(unittest.TestCase):
         self.assertIn("уже выбрана", reply.lower())
         self.assertIn("27.10.2026 18:43 МСК", reply)
         self.assertIn("49", reply)
-        self.assertIn("1", reply)
+        self.assertIn("OBEDINENO", reply)
+        self.assertIn("ряд 7", reply)
+        self.assertIn("колонка 1", reply)
         self.assertEqual(reply_bot.replies[0][1].get("parse_mode"), "HTML")
 
     def test_findarticle_reports_not_found_when_no_selected_match(self):

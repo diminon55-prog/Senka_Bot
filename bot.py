@@ -146,8 +146,17 @@ def reply_text(message, text):
 
 
 def build_mark_selection_keyboard(chat_id, matches):
-    """Кнопки выбора марки из списка дубликатов (по одной на марку)."""
+    """Кнопки выбора марки. Для одной марки — «Отметить»/«Отмена», для списка — по кнопке на марку + «Все»/«Отмена»."""
     keyboard = telebot.types.InlineKeyboardMarkup()
+    if len(matches) == 1:
+        m = matches[0]
+        keyboard.row(
+            telebot.types.InlineKeyboardButton(
+                "✅ Отметить", callback_data=f"sel:1:{m.id}"
+            ),
+            telebot.types.InlineKeyboardButton("❌ Отмена", callback_data="sel:cancel:0"),
+        )
+        return keyboard
     for idx, m in enumerate(matches, 1):
         label = f"{idx}. лист {m.page_number}, №{m.position_on_page}"
         keyboard.row(
@@ -421,6 +430,25 @@ def tool_find_marks(query: str, quantity: int = 1) -> str:
 
     result = marks_store.claim(chat_id, query, quantity)
     if result.matched == 0:
+        selected = marks_store.selected_marks_by_query(chat_id, query)
+        if selected:
+            first = selected[0]
+            when = format_selected_at_msk(first.selected_at) or "время не записано"
+            grid_columns = max(1, int(getattr(marks_store, "grid_columns", 8) or 8))
+            position = first.position_on_page
+            row_number = (position - 1) // grid_columns + 1
+            column_number = (position - 1) % grid_columns + 1
+            doc_name = html.escape(first.document_name or "—")
+            # Для /unmark подставляем короткий идентификатор: артикул или название, а не полный Data Matrix
+            unmark_hint = first.article or query
+            return (
+                f"⚠️ Марка по запросу <code>{html.escape(query)}</code> уже выбрана ранее "
+                f"(<i>{html.escape(when)}</i>):\n"
+                f"    └ 📄 {doc_name} │ лист {first.page_number}, №{position} "
+                f"(ряд {row_number}, колонка {column_number})\n\n"
+                f"Вернуть её в базу — /unmark {html.escape(unmark_hint)}. "
+                f"Остаток: {result.available}."
+            )
         return f"Марки по запросу '{query}' не найдены. Свободно: {result.available}."
 
     caption = f"✅ Найдено и отмечено: {result.matched}. Свободно: {result.available}."
@@ -481,11 +509,19 @@ def tool_find_article(article: str, quantity: int = 1) -> str:
         if selected:
             first = selected[0]
             when = format_selected_at_msk(first.selected_at) or "время не записано"
+            grid_columns = max(1, int(getattr(marks_store, "grid_columns", 8) or 8))
+            position = first.position_on_page
+            row_number = (position - 1) // grid_columns + 1
+            column_number = (position - 1) % grid_columns + 1
+            doc_name = html.escape(first.document_name or "—")
+            # Для /unmark подставляем артикул, а не полный Data Matrix из запроса
+            unmark_hint = first.article or article
             return (
                 f"⚠️ Марка <code>{html.escape(article)}</code> уже выбрана ранее "
                 f"(<i>{html.escape(when)}</i>):\n"
-                f"    └ лист {first.page_number}, №{first.position_on_page}\n\n"
-                f"Вернуть её в базу — /unmark {html.escape(article)}. "
+                f"    └ 📄 {doc_name} │ лист {first.page_number}, №{position} "
+                f"(ряд {row_number}, колонка {column_number})\n\n"
+                f"Вернуть её в базу — /unmark {html.escape(unmark_hint)}. "
                 f"Остаток: {result.available}."
             )
         return (
@@ -1020,23 +1056,36 @@ def handle_resetmarks_callback(call):
 
 @bot.message_handler(commands=['list', 'список'])
 def handle_list(message):
-    set_active_chat_id(message.chat.id)
-    csv_bytes = marks_store.export_selected_marks(message.chat.id)
-    if csv_bytes is None:
+    chat_id = message.chat.id
+    set_active_chat_id(chat_id)
+    selected = marks_store.list_selected_marks(chat_id)
+    if not selected:
         bot.reply_to(message, "Нет выбранных марок.")
         return
-    text = csv_bytes.decode("utf-8-sig")
-    lines = text.strip().split("\n")
-    if len(lines) <= 1:
-        bot.reply_to(message, "Нет выбранных марок.")
-        return
-    header = lines[0].split(";")
-    rows = [line.split(";") for line in lines[1:]]
-    table = [" | ".join(header)]
-    table.append("-" * len(table[0]))
-    for row in rows:
-        table.append(" | ".join(row[:4]))
-    bot.reply_to(message, "Выбранные марки:\n\n" + "\n".join(table))
+    lines = []
+    for idx, item in enumerate(selected, 1):
+        article = html.escape(item["article"] or "—")
+        name = html.escape(item["name"] or "—")
+        document = html.escape(item["document"] or "—")
+        when = format_selected_at_msk(item["selected_at"]) or "—"
+        lines.append(
+            f"<b>{idx}.</b> <code>{article}</code>\n"
+            f"    └ {name}\n"
+            f"    └ 📄 {document} │ л.{item['page']} №{item['position']} │ <i>{when}</i>"
+        )
+    text_header = f"📋 <b>Выбранные марки ({len(selected)}):</b>\n\n"
+    # Telegram лимит ~4096 символов на сообщение — шлём частями
+    chunks = []
+    current = text_header
+    for line in lines:
+        if len(current) + len(line) + 2 > 3800:
+            chunks.append(current)
+            current = ""
+        current += line + "\n"
+    if current.strip():
+        chunks.append(current)
+    for part in chunks:
+        bot.send_message(chat_id, part, parse_mode="HTML")
 
 
 # НОВАЯ КОМАНДА: РИСОВАНИЕ КАРТИНОК (ДОЛЖНА БЫТЬ ВЫШЕ TEXT!)
@@ -1102,10 +1151,13 @@ def handle_media(message):
             if len(detected_codes) == 1:
                 response = tool_find_marks(detected_codes[0], quantity=1)
                 if not response.startswith("✅"):
-                    bot.reply_to(
-                        message,
-                        "Data Matrix распознан, но свободная марка с таким кодом в базе не найдена.",
-                    )
+                    if response.startswith("⚠️"):
+                        reply_text(message, response)
+                    else:
+                        bot.reply_to(
+                            message,
+                            "Data Matrix распознан, но свободная марка с таким кодом в базе не найдена.",
+                        )
                 return
         mime = "image/jpeg" if message.content_type == 'photo' else "video/mp4"
         prompt = message.caption or "Изучи файл."
@@ -1345,6 +1397,58 @@ def handle_text(message):
         else:
             reply_text(message, response)
         return
+    # Локальный поиск по названию/цвету: если в тексте есть слово из названий марок —
+    # ищем без Gemini. Показываем все совпадения с кнопками.
+    words = re.findall(r"[а-яё]{3,}", (message.text or "").lower())
+    if words:
+        matches = marks_store.find_available_by_words(chat_id, words)
+        if len(matches) == 1:
+            # Одна марка — сразу спрашиваем подтверждение кнопками
+            m = matches[0]
+            pending_mark_selection[chat_id] = [m.id]
+            name = html.escape(m.display_name or m.article or "—")
+            text = (
+                f"🔍 Нашёл одну марку по запросу <code>{html.escape(message.text.strip())}</code>:\n\n"
+                f"<b>{name}</b>\n"
+                f"    └ <i>лист {m.page_number}, №{m.position_on_page}</i>\n\n"
+                f"<i>Отметить её?</i>"
+            )
+            bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=build_mark_selection_keyboard(chat_id, matches),
+            )
+            return
+        elif len(matches) > 1:
+            # Несколько — список с кнопками
+            pending_mark_selection[chat_id] = [m.id for m in matches]
+            document_names = {
+                doc["id"]: doc["product_name"] or doc["file_name"]
+                for doc in marks_store.list_documents(chat_id)
+            }
+            lines = []
+            for idx, m in enumerate(matches, 1):
+                name = html.escape(m.display_name or m.article or "—")
+                doc_name = html.escape(document_names.get(m.document_id, ""))
+                doc_suffix = f", 📄 {doc_name}" if doc_name else ""
+                lines.append(
+                    f"<b>{idx}.</b> {name}\n"
+                    f"    └ <i>лист {m.page_number}, №{m.position_on_page}{doc_suffix}</i>"
+                )
+            text = (
+                f"🔍 По запросу <code>{html.escape(message.text.strip())}</code> "
+                f"найдено <b>{len(matches)}</b> марок:\n\n"
+                + "\n".join(lines)
+                + "\n\n<i>Нажми кнопку ниже, введи номера через запятую, или «все».</i>"
+            )
+            bot.send_message(
+                chat_id,
+                text,
+                parse_mode="HTML",
+                reply_markup=build_mark_selection_keyboard(chat_id, matches),
+            )
+            return
     try:
         thinking_msg = bot.reply_to(message, "<blockquote>⚙️ Думаю...</blockquote>", parse_mode="HTML")
         resp = call_with_503_retry(
