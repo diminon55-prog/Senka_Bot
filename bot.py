@@ -1,4 +1,4 @@
-import os, re, zipfile, rarfile, io, telebot, time, html
+import os, re, zipfile, rarfile, io, telebot, time, html, logging, random, threading
 from pathlib import Path
 import pymupdf as fitz
 from contextvars import ContextVar
@@ -31,6 +31,8 @@ from settings import (
     TELEGRAM_TOKEN,
 )
 
+LOGGER = logging.getLogger(__name__)
+
 ai_client = genai.Client()
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -51,10 +53,33 @@ def get_active_chat_id():
 
 bot_stats = {"requests": 0, "tokens": 0}
 
+PHOTO_PROCESSING_PHRASES = (
+    "🔥 У меня плавится сервер: отражаю атаку фотогалереи…",
+    "🧠 Разгоняю нейроны. Кулер уже просит отпуск…",
+    "🖥 Загружаю пиксели. Один байт пытался сбежать…",
+    "🐛 Ищу смысл на фото. Баги прячутся за кадром…",
+    "☕ Компилирую взгляд. Кофе добавлен в зависимости…",
+    "📡 Допрашиваю пиксели по протоколу TCP…",
+    "🤖 Нейросеть надела очки. Резкость почти найдена…",
+    "🧯 Сервер дымится, но делает вид, что это облако…",
+    "⚙️ Кручу вентиляторы и мысли одновременно…",
+    "📸 Пиксели проходят собеседование. Не мешайте HR…",
+    "🧩 Собираю изображение. Один пиксель ушёл на удалёнку…",
+    "🚀 Отправил фото в космос вычислений. Жду посадку…",
+)
+_photo_phrase_pools = {}
+_last_photo_phrase = {}
+_photo_phrase_lock = threading.Lock()
+
 HELP_BUTTON_TEXT = "ℹ️ Что умеет Сеня?"
 PLAIN_ARTICLE_PATTERN = re.compile(
     r"(?:COVANI\s+)?(?=[A-Z0-9$А-ЯЁ-]*[A-ZА-ЯЁ])(?=[A-Z0-9$А-ЯЁ-]*\d)"
     r"[A-Z0-9$]{2,}(?:-[A-Z0-9$А-ЯЁ]{2,})+",
+    re.IGNORECASE,
+)
+AI_ARTICLE_PATTERN = re.compile(
+    r"(?:артикул|article|арт\.?|art\.?\s*(?:no\.?)?)\s*[:№#-]?\s*"
+    r"([A-ZА-ЯЁ0-9$][A-ZА-ЯЁ0-9$/.-]{2,30})",
     re.IGNORECASE,
 )
 HELP_TEXT = (
@@ -97,9 +122,30 @@ def build_main_keyboard():
     return keyboard
 
 
+def next_photo_processing_phrase(chat_id):
+    with _photo_phrase_lock:
+        pool = _photo_phrase_pools.get(chat_id)
+        if not pool:
+            pool = list(PHOTO_PROCESSING_PHRASES)
+            random.shuffle(pool)
+            previous = _last_photo_phrase.get(chat_id)
+            if previous and len(pool) > 1 and pool[-1] == previous:
+                pool[0], pool[-1] = pool[-1], pool[0]
+            _photo_phrase_pools[chat_id] = pool
+        phrase = pool.pop()
+        _last_photo_phrase[chat_id] = phrase
+        return phrase
+
+
 def extract_plain_article(text):
     candidate = re.sub(r"\s+", " ", (text or "").strip())
     return candidate if PLAIN_ARTICLE_PATTERN.fullmatch(candidate) else ""
+
+
+def extract_article_from_ai_response(text):
+    """Extract an explicitly labelled article from a free-form AI description."""
+    match = AI_ARTICLE_PATTERN.search(text or "")
+    return match.group(1).rstrip(".,;:") if match else ""
 
 
 def send_claimed_document(chat_id, result, caption):
@@ -143,6 +189,25 @@ def reply_text(message, text):
     if "<" in text and ">" in text:
         return bot.reply_to(message, text, parse_mode="HTML")
     return bot.reply_to(message, text)
+
+
+def edit_ai_response(chat_id, message_id, text):
+    """Edit an AI reply as Markdown, falling back to plain text if Telegram rejects it."""
+    try:
+        return bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+            parse_mode="Markdown",
+        )
+    except Exception as error:
+        if "can't parse entities" not in str(error).lower():
+            raise
+        return bot.edit_message_text(
+            chat_id=chat_id,
+            message_id=message_id,
+            text=text,
+        )
 
 
 def build_mark_selection_keyboard(chat_id, matches):
@@ -243,6 +308,36 @@ def call_with_503_retry(operation, *args, **kwargs):
             retries += 1
             time.sleep(RETRY_DELAY_SECONDS)
 
+def is_transient_network_error(error):
+    error_text = str(error).casefold()
+    return isinstance(error, (TimeoutError, ConnectionError)) or any(
+        marker in error_text
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection aborted",
+            "connection reset",
+            "remote end closed connection",
+            "broken pipe",
+        )
+    )
+
+def call_with_network_retry(operation, *args, **kwargs):
+    retries = 0
+    while True:
+        try:
+            return operation(*args, **kwargs)
+        except Exception as error:
+            if not is_transient_network_error(error) or retries >= MAX_503_RETRIES:
+                raise
+            retries += 1
+            time.sleep(RETRY_DELAY_SECONDS)
+
+def download_telegram_file(file_id):
+    return call_with_network_retry(
+        lambda: bot.download_file(bot.get_file(file_id).file_path)
+    )
+
 def update_stats(resp):
     global bot_stats
     bot_stats["requests"] += 1
@@ -340,11 +435,21 @@ def make_a3_layout(pdf_bytes, base_name="STROBS", cut_w_mm=50.0, cut_h_mm=40.0, 
     return pb, cb, f"{clean}_A3_1_soderzhimoe.pdf", f"{clean}_A3_2_rez.pdf", info
 
 def handle_ai_error(e, chat_id, message, thinking_msg=None):
+    LOGGER.error(
+        "Ошибка обработки сообщения в чате %s",
+        chat_id,
+        exc_info=(type(e), e, e.__traceback__),
+    )
     err = str(e).lower()
-    if "429" in err and "resource_exhausted" in err:
+    if is_transient_network_error(e):
+        text = "🌐 Связь прервалась, и запрос не завершился. Попробуй ещё раз через несколько секунд."
+    elif "429" in err and "resource_exhausted" in err:
         text = "⏳ **Упс, перегрев!**\nМы уперлись в лимит токенов. Подожди минуту и попробуй снова!"
     else:
-        text = f"Ошибка:\n`{err}`"
+        text = (
+            "⚠️ Не получилось обработать запрос. Попробуй ещё раз. "
+            "Если ошибка повторится, сообщи администратору время сообщения."
+        )
     try:
         if thinking_msg: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=text, parse_mode="Markdown")
         else: bot.reply_to(message, text, parse_mode="Markdown")
@@ -1137,8 +1242,18 @@ def handle_media(message):
     if media.file_size and media.file_size > MAX_FILE_SIZE:
         bot.reply_to(message, "⚠️ Файл тяжелее 20 МБ, Телега не даст скачать!")
         return
+    if message.content_type == 'photo':
+        send_chat_action = getattr(bot, "send_chat_action", None)
+        if send_chat_action:
+            try:
+                send_chat_action(chat_id, "typing")
+            except Exception as error:
+                LOGGER.debug(
+                    "Не удалось показать индикатор обработки фото",
+                    exc_info=(type(error), error, error.__traceback__),
+                )
     try:
-        data = bot.download_file(bot.get_file(media.file_id).file_path)
+        data = download_telegram_file(media.file_id)
         if message.content_type == 'photo':
             detected_codes = marks_store.decode_image(data)
             if len(detected_codes) > 1:
@@ -1161,36 +1276,49 @@ def handle_media(message):
                 return
         mime = "image/jpeg" if message.content_type == 'photo' else "video/mp4"
         prompt = message.caption or "Изучи файл."
-        thinking_msg = bot.reply_to(message, "<blockquote>⚙️ Мозгую варианты...</blockquote>", parse_mode="HTML")
+        processing_phrase = (
+            next_photo_processing_phrase(chat_id)
+            if message.content_type == 'photo'
+            else "🎞 Разбираю видео по кадрам. Процессор держится из последних герц…"
+        )
+        try:
+            thinking_msg = bot.reply_to(
+                message,
+                f"<blockquote>{processing_phrase}</blockquote>",
+                parse_mode="HTML",
+            )
+        except Exception as error:
+            if not is_transient_network_error(error):
+                raise
+            thinking_msg = None
         resp = call_with_503_retry(
             get_chat_session(chat_id).send_message,
             [types.Part.from_bytes(data=data, mime_type=mime), prompt],
         )
         update_stats(resp)
         if resp.text:
-            bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
-            # Ищем марку по тексту ответа Gemini: сначала артикул, потом название
-            article_match = re.search(
-                r"(?:артикул|article)[:\s]*([A-Z0-9][A-Z0-9\-/\.]{3,20})",
-                resp.text,
-                re.IGNORECASE,
-            )
-            query = article_match.group(1).strip() if article_match else resp.text.strip()
-            # Сначала ищем по названию (включая mark_text_index)
-            response = tool_find_marks(query, quantity=1)
+            if thinking_msg:
+                edit_ai_response(chat_id, thinking_msg.message_id, resp.text)
+            else:
+                bot.reply_to(message, resp.text)
+            article = extract_article_from_ai_response(resp.text)
+            if not article:
+                return
+            # Сначала ищем точный артикул по всем документам и готовым CSV-индексам.
+            response = tool_find_marks(article, quantity=1)
             if response.startswith("✅"):
                 bot.reply_to(message, response)
-            else:
-                # Потом пробуем как артикул, но без OCR — только по уже распознанным
-                try:
-                    article_response = tool_find_article(query)
-                except ArticleOcrError:
-                    article_response = "OCR не завершён"
-                if article_response.startswith("✅"):
-                    reply_text(message, article_response)
-                else:
-                    reply_text(message, article_response)
-                    return
+                return
+            if response.startswith("⚠️"):
+                reply_text(message, response)
+                return
+            # OCR нужен только когда готовые индексы не нашли артикул.
+            try:
+                article_response = tool_find_article(article)
+            except ArticleOcrError:
+                article_response = "OCR не завершён"
+            reply_text(message, article_response)
+            return
     except Exception as e:
         handle_ai_error(e, chat_id, message, thinking_msg)
 
@@ -1209,7 +1337,7 @@ def handle_doc(message):
         return
         
     try:
-        data = bot.download_file(bot.get_file(doc.file_id).file_path)
+        data = download_telegram_file(doc.file_id)
 
         if fname.endswith('.csv'):
             result = marks_store.import_search_index_csv(chat_id, orig, data)
@@ -1261,7 +1389,7 @@ def handle_doc(message):
                 prompt,
             )
             update_stats(resp)
-            if resp.text: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+            if resp.text: edit_ai_response(chat_id, thinking_msg.message_id, resp.text)
             return
             
         # Для обычных единичных файлов
@@ -1272,7 +1400,7 @@ def handle_doc(message):
             parts,
         )
         update_stats(resp)
-        if resp.text: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+        if resp.text: edit_ai_response(chat_id, thinking_msg.message_id, resp.text)
     except Exception as e:
         handle_ai_error(e, chat_id, message, thinking_msg)
 
@@ -1456,7 +1584,7 @@ def handle_text(message):
             message.text,
         )
         update_stats(resp)
-        if resp.text: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+        if resp.text: edit_ai_response(chat_id, thinking_msg.message_id, resp.text)
     except Exception as e:
         handle_ai_error(e, chat_id, message, None)
 
@@ -1488,7 +1616,7 @@ def handle_voice(message):
         bot.reply_to(message, "⚠️ Голосовое тяжелее 20 МБ, Телега не даст скачать!")
         return
     try:
-        data = bot.download_file(bot.get_file(voice.file_id).file_path)
+        data = download_telegram_file(voice.file_id)
         text = transcribe_voice(data)
         if not text:
             bot.reply_to(
@@ -1525,7 +1653,7 @@ def handle_voice(message):
             text,
         )
         update_stats(resp)
-        if resp.text: bot.edit_message_text(chat_id=chat_id, message_id=thinking_msg.message_id, text=resp.text, parse_mode="Markdown")
+        if resp.text: edit_ai_response(chat_id, thinking_msg.message_id, resp.text)
     except Exception as e:
         handle_ai_error(e, chat_id, message, thinking_msg)
 

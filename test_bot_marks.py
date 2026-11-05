@@ -1,6 +1,7 @@
 import unittest
 import threading
 from types import SimpleNamespace
+from unittest import mock
 
 from marks_inventory import ArticleOcrError
 from test_bot_retry import load_bot_module
@@ -169,6 +170,82 @@ class BotMarksIntegrationTests(unittest.TestCase):
 
         self.assertIn(("127575/06-03", 1), calls)
 
+    def test_photo_extracts_abbreviated_article_before_searching_all_documents(self):
+        bot_module = load_bot_module()
+        photo_bot = FakePhotoBot(b"photo-bytes")
+        photo_bot.edit_message_text = lambda **kwargs: None
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(decode_image=lambda payload: [])
+        session = SimpleNamespace(
+            send_message=lambda parts: SimpleNamespace(
+                text="Ботинки GRUNBERG\nАрт. 138153/04-01\nЦвет: чёрный"
+            )
+        )
+        bot_module.get_chat_session = lambda chat_id: session
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+        calls = []
+        bot_module.tool_find_marks = lambda query, quantity=1: (
+            calls.append((query, quantity))
+            or "✅ Найдено и отмечено: 1. Свободно: 0."
+        )
+        bot_module.tool_find_article = lambda *args, **kwargs: self.fail(
+            "После успешного поиска по всем документам OCR текущего PDF не нужен"
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+            caption="",
+        )
+
+        bot_module.handle_media(message)
+
+        self.assertEqual(calls, [("138153/04-01", 1)])
+
+    def test_photo_response_falls_back_to_plain_text_when_markdown_is_invalid(self):
+        bot_module = load_bot_module()
+
+        class MarkdownRejectingPhotoBot(FakePhotoBot):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.edits = []
+
+            def edit_message_text(self, **kwargs):
+                self.edits.append(kwargs)
+                if kwargs.get("parse_mode") == "Markdown":
+                    raise RuntimeError(
+                        "Bad Request: can't parse entities: can't find end of the entity "
+                        "starting at byte offset 149"
+                    )
+                return SimpleNamespace(message_id=kwargs["message_id"])
+
+        photo_bot = MarkdownRejectingPhotoBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(decode_image=lambda payload: [])
+        gemini_text = "Полуботинки _GRUNBERG, артикул 127575/06-03"
+        bot_module.get_chat_session = lambda chat_id: SimpleNamespace(
+            send_message=lambda parts: SimpleNamespace(text=gemini_text)
+        )
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+        bot_module.tool_find_marks = lambda query, quantity=1: (
+            "✅ Найдено и отмечено: 1. Свободно: 9."
+        )
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+            caption="",
+        )
+
+        bot_module.handle_media(message)
+
+        self.assertEqual(photo_bot.edits[0]["parse_mode"], "Markdown")
+        self.assertNotIn("parse_mode", photo_bot.edits[1])
+        self.assertEqual(photo_bot.edits[1]["text"], gemini_text)
+        self.assertFalse(any(text.startswith("Ошибка:") for text, _ in photo_bot.replies))
+
     def test_photo_without_article_stays_in_gemini_dialog(self):
         bot_module = load_bot_module()
         photo_bot = FakePhotoBot(b"photo-bytes")
@@ -201,6 +278,180 @@ class BotMarksIntegrationTests(unittest.TestCase):
         bot_module.handle_media(message)
 
         self.assertEqual(len(photo_bot.replies), 1)
+
+    def test_photo_gallery_uses_different_short_it_status_for_each_photo(self):
+        bot_module = load_bot_module()
+
+        class GalleryPhotoBot(FakePhotoBot):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.edits = []
+
+            def edit_message_text(self, **kwargs):
+                self.edits.append(kwargs)
+                return SimpleNamespace(message_id=kwargs["message_id"])
+
+        photo_bot = GalleryPhotoBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(decode_image=lambda payload: [])
+        bot_module.get_chat_session = lambda chat_id: SimpleNamespace(
+            send_message=lambda parts: SimpleNamespace(text="Фото принято")
+        )
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+
+        for index in range(4):
+            message = SimpleNamespace(
+                chat=SimpleNamespace(id=77),
+                content_type="photo",
+                photo=[SimpleNamespace(file_id=f"photo-{index}", file_size=100)],
+                caption="",
+            )
+            bot_module.handle_media(message)
+
+        status_texts = [text for text, _ in photo_bot.replies]
+        self.assertEqual(len(status_texts), 4)
+        self.assertEqual(len(set(status_texts)), 4)
+        for text, kwargs in photo_bot.replies:
+            self.assertEqual(kwargs.get("parse_mode"), "HTML")
+            self.assertTrue(text.startswith("<blockquote>"))
+            self.assertTrue(text.endswith("</blockquote>"))
+            self.assertLessEqual(len(text), 140)
+
+    def test_photo_shows_typing_action_before_download(self):
+        bot_module = load_bot_module()
+
+        class ActionPhotoBot(FakePhotoBot):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.events = []
+
+            def send_chat_action(self, chat_id, action):
+                self.events.append(("action", chat_id, action))
+
+            def download_file(self, file_path):
+                self.events.append(("download", file_path))
+                return self.payload
+
+            def edit_message_text(self, **kwargs):
+                return SimpleNamespace(message_id=kwargs["message_id"])
+
+        photo_bot = ActionPhotoBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(decode_image=lambda payload: [])
+        bot_module.get_chat_session = lambda chat_id: SimpleNamespace(
+            send_message=lambda parts: SimpleNamespace(text="Фото принято")
+        )
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+            caption="",
+        )
+
+        bot_module.handle_media(message)
+
+        self.assertEqual(photo_bot.events[0], ("action", 77, "typing"))
+        self.assertEqual(photo_bot.events[1][0], "download")
+
+    def test_photo_download_retries_transient_telegram_timeout(self):
+        bot_module = load_bot_module()
+
+        class FlakyDownloadBot(FakePhotoBot):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.download_attempts = 0
+                self.edits = []
+
+            def download_file(self, file_path):
+                self.download_attempts += 1
+                if self.download_attempts == 1:
+                    raise ConnectionError(
+                        "Connection aborted.",
+                        TimeoutError("The write operation timed out"),
+                    )
+                return self.payload
+
+            def edit_message_text(self, **kwargs):
+                self.edits.append(kwargs)
+                return SimpleNamespace(message_id=kwargs["message_id"])
+
+        photo_bot = FlakyDownloadBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(decode_image=lambda payload: [])
+        bot_module.get_chat_session = lambda chat_id: SimpleNamespace(
+            send_message=lambda parts: SimpleNamespace(text="Фото принято")
+        )
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+            caption="",
+        )
+
+        with mock.patch.object(bot_module.time, "sleep") as sleep:
+            bot_module.handle_media(message)
+
+        self.assertEqual(photo_bot.download_attempts, 2)
+        sleep.assert_called_once_with(bot_module.RETRY_DELAY_SECONDS)
+        self.assertEqual(photo_bot.edits[-1]["text"], "Фото принято")
+        self.assertFalse(
+            any("connection aborted" in text.casefold() for text, _ in photo_bot.replies)
+        )
+
+    def test_photo_processing_continues_when_thinking_reply_times_out(self):
+        bot_module = load_bot_module()
+
+        class ThinkingTimeoutBot(FakePhotoBot):
+            def __init__(self, payload):
+                super().__init__(payload)
+                self.reply_attempts = 0
+
+            def reply_to(self, message, text, **kwargs):
+                self.reply_attempts += 1
+                if self.reply_attempts == 1:
+                    raise ConnectionError(
+                        "Connection aborted.",
+                        TimeoutError("The write operation timed out"),
+                    )
+                self.replies.append((text, kwargs))
+                return SimpleNamespace(message_id=self.reply_attempts)
+
+            def edit_message_text(self, **kwargs):
+                self.fail("Без сообщения «Мозгую» ответ нужно отправить новым сообщением")
+
+            def fail(self, message):
+                raise AssertionError(message)
+
+        photo_bot = ThinkingTimeoutBot(b"photo-bytes")
+        bot_module.bot = photo_bot
+        bot_module.marks_store = SimpleNamespace(decode_image=lambda payload: [])
+        gemini_calls = []
+        bot_module.get_chat_session = lambda chat_id: SimpleNamespace(
+            send_message=lambda parts: (
+                gemini_calls.append(parts) or SimpleNamespace(text="Фото принято")
+            )
+        )
+        bot_module.call_with_503_retry = lambda fn, arg: fn(arg)
+        bot_module.update_stats = lambda resp: None
+        message = SimpleNamespace(
+            chat=SimpleNamespace(id=77),
+            content_type="photo",
+            photo=[SimpleNamespace(file_id="photo-id", file_size=100)],
+            caption="",
+        )
+
+        bot_module.handle_media(message)
+
+        self.assertEqual(len(gemini_calls), 1)
+        self.assertEqual(photo_bot.replies[-1][0], "Фото принято")
+        self.assertFalse(
+            any("связь прервалась" in text.casefold() for text, _ in photo_bot.replies)
+        )
 
     def test_photo_with_one_datamatrix_claims_matching_mark_without_gemini(self):
         bot_module = load_bot_module()

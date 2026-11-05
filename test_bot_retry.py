@@ -87,6 +87,109 @@ class Retry503Tests(unittest.TestCase):
         self.assertEqual(attempts, 2)
         sleep.assert_called_once_with(4)
 
+    def test_network_timeout_is_reported_without_internal_exception_details(self):
+        bot_module = load_bot_module()
+
+        class ReplyBot:
+            def __init__(self):
+                self.replies = []
+
+            def reply_to(self, message, text, **kwargs):
+                self.replies.append((text, kwargs))
+
+        reply_bot = ReplyBot()
+        bot_module.bot = reply_bot
+        message = object()
+        error = ConnectionError(
+            "Connection aborted.",
+            TimeoutError("The write operation timed out"),
+        )
+
+        with mock.patch.object(bot_module, "LOGGER"):
+            bot_module.handle_ai_error(error, chat_id=77, message=message)
+
+        text, _ = reply_bot.replies[0]
+        self.assertIn("связ", text.casefold())
+        self.assertIn("попроб", text.casefold())
+        self.assertNotIn("connection aborted", text.casefold())
+        self.assertNotIn("timeouterror", text.casefold())
+
+    def test_generic_error_is_logged_but_not_exposed_to_user(self):
+        bot_module = load_bot_module()
+
+        class ReplyBot:
+            def __init__(self):
+                self.replies = []
+
+            def reply_to(self, message, text, **kwargs):
+                self.replies.append((text, kwargs))
+
+        reply_bot = ReplyBot()
+        bot_module.bot = reply_bot
+        error = RuntimeError("private backend detail")
+
+        with mock.patch.object(bot_module, "LOGGER") as logger:
+            bot_module.handle_ai_error(error, chat_id=77, message=object())
+
+        text, _ = reply_bot.replies[0]
+        self.assertIn("не получилось", text.casefold())
+        self.assertNotIn("private backend detail", text.casefold())
+        logger.error.assert_called_once()
+
+    def test_ai_response_retries_as_plain_text_when_markdown_is_invalid(self):
+        bot_module = load_bot_module()
+
+        class ParseRejectingBot:
+            def __init__(self):
+                self.calls = []
+
+            def edit_message_text(self, **kwargs):
+                self.calls.append(kwargs)
+                if kwargs.get("parse_mode") == "Markdown":
+                    raise RuntimeError(
+                        "Bad Request: can't parse entities: can't find end of the entity "
+                        "starting at byte offset 149"
+                    )
+                return "sent-as-plain-text"
+
+        fake_bot = ParseRejectingBot()
+        bot_module.bot = fake_bot
+
+        result = bot_module.edit_ai_response(
+            chat_id=77,
+            message_id=123,
+            text="Ответ Gemini с незакрытым _Markdown",
+        )
+
+        self.assertEqual(result, "sent-as-plain-text")
+        self.assertEqual(fake_bot.calls[0]["parse_mode"], "Markdown")
+        self.assertNotIn("parse_mode", fake_bot.calls[1])
+        self.assertEqual(fake_bot.calls[1]["text"], "Ответ Gemini с незакрытым _Markdown")
+
+    def test_no_ai_response_is_sent_as_unchecked_markdown(self):
+        tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"))
+        unsafe_lines = []
+
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not isinstance(node.func, ast.Attribute) or node.func.attr != "edit_message_text":
+                continue
+            keywords = {keyword.arg: keyword.value for keyword in node.keywords}
+            text_value = keywords.get("text")
+            parse_mode = keywords.get("parse_mode")
+            if (
+                isinstance(text_value, ast.Attribute)
+                and isinstance(text_value.value, ast.Name)
+                and text_value.value.id == "resp"
+                and text_value.attr == "text"
+                and isinstance(parse_mode, ast.Constant)
+                and parse_mode.value == "Markdown"
+            ):
+                unsafe_lines.append(node.lineno)
+
+        self.assertEqual(unsafe_lines, [])
+
     def test_every_gemini_request_uses_the_retry_helper(self):
         tree = ast.parse(BOT_PATH.read_text(encoding="utf-8"))
         wrapped_operations = []
